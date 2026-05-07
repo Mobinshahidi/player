@@ -90,9 +90,16 @@ export const MPV_SOCKET = join(CONFIG_DIR, "mpv.sock");
 export const IS_TERMUX =
   process.env.PREFIX?.includes("com.termux") ||
   existsSync("/data/data/com.termux");
+// Use the canonical /storage/emulated/0 path — /sdcard is a symlink that VLC
+// and Android's MediaStore do NOT follow when resolving content:// URIs.
+// termux-open / termux-share also require the real path.
 export const TERMUX_VIDEO_DIR = IS_TERMUX
   ? process.env.PLAYER_TERMUX_VIDEO_DIR ||
-    (existsSync("/sdcard") ? "/sdcard/player-cache" : VIDEO_DIR)
+    (existsSync("/storage/emulated/0")
+      ? "/storage/emulated/0/player-cache"
+      : existsSync("/sdcard")
+        ? "/sdcard/player-cache"
+        : VIDEO_DIR)
   : VIDEO_DIR;
 export const END_THRESHOLD_SECONDS = 60;
 export const END_THRESHOLD_RATIO = 0.95;
@@ -272,7 +279,10 @@ export async function s3Request(
 // ─── PROGRESS STORE ──────────────────────────────────────────────────────────
 
 export function ensureConfigDir() {
-  for (const d of [CONFIG_DIR, CACHE_DIR, VIDEO_DIR])
+  const dirs = [CONFIG_DIR, CACHE_DIR, VIDEO_DIR];
+  // On Termux, also guarantee the shared-storage cache dir exists so VLC can read it.
+  if (IS_TERMUX && TERMUX_VIDEO_DIR !== VIDEO_DIR) dirs.push(TERMUX_VIDEO_DIR);
+  for (const d of dirs)
     if (!existsSync(d)) mkdirSync(d, { recursive: true });
 }
 
@@ -1207,24 +1217,46 @@ export async function playWithVlcAndroid(
     if (existsSync(localPath) && videoFileSize(localPath) >= 2_097_152) break;
   }
 
-  const fileUri = encodeURI(`file://${localPath}`);
   const posMs = Math.floor(startTime * 1000);
-  const extras =
+  const amExtras =
     posMs > 0
       ? `--el position ${posMs} --ez from_start false`
       : `--ez from_start true`;
 
-  // Try opening the local file first (best experience); fall back to remote URL
-  function launchVlc(uri: string): boolean {
-    const cmd = `am start -a android.intent.action.VIEW -n "${VLC_PACKAGE}/.gui.video.VideoPlayerActivity" -d "${uri}" -t "video/*" ${extras}`;
+  // Android 7+ blocks file:// URIs between apps (FileUriExposedException).
+  // Project lives in /data/data/com.termux/... which is inaccessible to VLC.
+  // The only reliable path: copy the file to /storage/emulated/0/player-cache
+  // (which TERMUX_VIDEO_DIR already points to) then open it via termux-open
+  // which wraps a proper content:// URI through Termux's FileProvider.
+  function launchVlcLocal(path: string): boolean {
+    // termux-open (from termux-tools) handles the FileProvider bridge.
+    // It respects the default video app set on the device (usually VLC).
+    try {
+      execSync(`termux-open --content-type "video/*" "${path}"`, {
+        stdio: "ignore", timeout: 5000,
+      });
+      return true;
+    } catch {}
+    // termux-share opens an Android chooser — user picks VLC there.
+    try {
+      execSync(`termux-share -a view "${path}"`, {
+        stdio: "ignore", timeout: 5000,
+      });
+      return true;
+    } catch {}
+    return false;
+  }
+
+  function launchVlcRemote(url: string): boolean {
+    // Remote URLs don't hit the FileProvider restriction.
+    const cmd = `am start -a android.intent.action.VIEW -n "${VLC_PACKAGE}/.gui.video.VideoPlayerActivity" -d "${url}" -t "video/*" ${amExtras}`;
     try {
       execSync(cmd, { stdio: "ignore", timeout: 5000 });
       return true;
     } catch {}
-    // Fallback: implicit intent without component name
     try {
       execSync(
-        `am start -a android.intent.action.VIEW -d "${uri}" -t "video/*" ${extras}`,
+        `am start -a android.intent.action.VIEW -d "${url}" -t "video/*" ${amExtras}`,
         { stdio: "ignore", timeout: 5000 },
       );
       return true;
@@ -1232,7 +1264,9 @@ export async function playWithVlcAndroid(
     return false;
   }
 
-  const launched = launchVlc(fileUri) || launchVlc(episodeUrl);
+  // Always try the cached local file first (enables resume + seek).
+  // Fall back to streaming the remote URL if the file isn't accessible.
+  const launched = launchVlcLocal(localPath) || launchVlcRemote(episodeUrl);
   if (launched) {
     console.log("[VLC launched — return here when done watching]");
   } else {

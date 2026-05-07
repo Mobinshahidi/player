@@ -633,7 +633,16 @@ async function playSelected(): Promise<void> {
   const vlcPrompts = IS_TERMUX ? tuiVlcPrompts : undefined;
   if (!playInKitty) {
     setTuiActive(false);
-    (screen as any).leave?.();
+    if (IS_TERMUX) {
+      // On Termux: drop out of the blessed alt-screen entirely so VLC gets a
+      // clean terminal surface.  blessed's leave() / screen.destroy() are too
+      // aggressive; program-level buffer switch is enough and lets us restore.
+      screen.program.showCursor();
+      screen.program.normalBuffer();
+      process.stdout.write("\x1b[2J\x1b[H"); // clear the now-normal screen
+    } else {
+      (screen as any).leave?.();
+    }
   }
   try {
     if ((p.isMovie || isDirectVideoUrl(p.url)) && !p.manualUrls?.length) {
@@ -849,7 +858,15 @@ async function playSelected(): Promise<void> {
     playError = (e as Error).message || "Playback failed";
   }
 
-  if (!playInKitty) (screen as any).enter?.();
+  if (!playInKitty) {
+    if (IS_TERMUX) {
+      // Restore the blessed alt-screen after VLC closes.
+      screen.program.alternateBuffer();
+      screen.program.hideCursor();
+    } else {
+      (screen as any).enter?.();
+    }
+  }
   refreshList();
   listBox.focus();
   if (!playInKitty) setTuiActive(true);
