@@ -4,8 +4,16 @@
 //       would immediately launch the CLI). Playback uses player-core directly.
 
 import blessed from "blessed";
-import { spawn } from "child_process";
-import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "fs";
+import { execSync, spawn } from "child_process";
+import {
+  appendFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  writeFileSync,
+} from "fs";
 import { homedir } from "os";
 import { basename, dirname, join, resolve } from "path";
 import {
@@ -26,12 +34,22 @@ import {
   applyImport,
   exportToFile,
   ARVAN_SYNC,
+  IS_TERMUX,
+  CONFIG_DIR,
+  deleteVideoCache,
   isDirectVideoUrl,
   playWithMpv,
   resolveEpisodes,
   getSeasonUrl,
+  splitUrlBlock,
+  extractEpisodeNumber,
 } from "./player-core.js";
-import type { SeriesProgress, ImportPreview, SeriesProjectEntry } from "./player-core.js";
+import type {
+  SeriesProgress,
+  ImportPreview,
+  SeriesProjectEntry,
+  VlcPrompts,
+} from "./player-core.js";
 
 // ─── COLOR PALETTE ────────────────────────────────────────────────────────────
 
@@ -45,6 +63,7 @@ const NEUTRAL     = "#c3c2b7";
 const HINT        = "#6b6b64";
 const HEADER_BG   = "#161615";
 const ACCENT      = "#d57455";
+const LOG_PATH    = join(CONFIG_DIR, "player-tui.log");
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
 
@@ -61,6 +80,116 @@ function relativeTime(iso: string | undefined): string {
 
 function prettifyKey(key: string): string {
   return key.replace(/[._-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()).trim();
+}
+
+function parseUrlInput(raw: string): string[] {
+  const urls = splitUrlBlock(raw)
+    .map((u) => u.trim())
+    .filter(Boolean);
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const u of urls) {
+    if (!seen.has(u)) {
+      seen.add(u);
+      out.push(u);
+    }
+  }
+  if (out.length > 1) {
+    out.sort((a, b) => extractEpisodeNumber(a) - extractEpisodeNumber(b));
+  }
+  return out;
+}
+
+function ensureLogDir(): void {
+  try {
+    mkdirSync(CONFIG_DIR, { recursive: true });
+  } catch {}
+}
+
+function logToFile(msg: string): void {
+  try {
+    ensureLogDir();
+    appendFileSync(LOG_PATH, `${new Date().toISOString()} ${msg}\n`);
+  } catch {}
+}
+
+function sortEpisodeUrls(urls: string[]): string[] {
+  return [...urls].sort((a, b) => extractEpisodeNumber(a) - extractEpisodeNumber(b));
+}
+
+async function offerHardsubTui(localPath: string): Promise<void> {
+  if (!existsSync(localPath)) return;
+  try {
+    execSync("which stoh", { stdio: "ignore" });
+  } catch {
+    return;
+  }
+  const want = await confirmDialog("Create hardsub from this episode?", "Create");
+  if (!want) return;
+  const rawDir = await promptText("Hardsub", "Output folder:", join(localPath, ".."));
+  if (rawDir === null) return;
+  const outputDir = rawDir || join(localPath, "..");
+  const displayName = localPath.split("/").pop() ?? localPath;
+  showInfo(`Hardsub started: ${displayName}`);
+  let totalSeconds = 0;
+  try {
+    const probe = execSync(
+      `ffprobe -v error -select_streams v:0 -show_entries format=duration -of csv=p=0 "${localPath}"`,
+      { encoding: "utf-8" },
+    ).trim();
+    totalSeconds = parseFloat(probe) || 0;
+  } catch {}
+  const proc = spawn("stoh", [localPath, "-t", "0", "-d", outputDir], {
+    stdio: ["ignore", "pipe", "pipe"],
+    detached: false,
+  });
+  function parseFfmpegTime(line: string): number | null {
+    const m = line.match(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/);
+    if (!m) return null;
+    return parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseFloat(m[3]);
+  }
+  let hadProgress = false;
+  function handleOutput(data: Buffer) {
+    for (const line of data.toString().split(/[\r\n]+/)) {
+      const t = parseFfmpegTime(line);
+      if (t === null) continue;
+      const pct =
+        totalSeconds > 0
+          ? ` (${Math.min(100, Math.round((t / totalSeconds) * 100))}%)`
+          : "";
+      showInfo(`Hardsub ${displayName} ${formatTime(Math.round(t))}${pct}`);
+      hadProgress = true;
+    }
+  }
+  proc.stdout?.on("data", handleOutput);
+  proc.stderr?.on("data", handleOutput);
+  proc.on("exit", (code) => {
+    if (!hadProgress) return;
+    if (code === 0) showInfo(`Hardsub done: ${displayName}`);
+    else showError(`Hardsub failed (exit ${code}): ${displayName}`);
+  });
+}
+
+async function promptAfterFinishedTui(key: string, p: SeriesProgress): Promise<void> {
+  if (p.isOnetime) {
+    removeEntry(key);
+    showInfo(`Removed: ${prettifyKey(key)}`);
+    return;
+  }
+  const ans = await promptText(
+    "Finished",
+    "Choose: r=remove, f=mark finished, Enter=keep",
+    "f",
+  );
+  if (ans === null) return;
+  const v = ans.trim().toLowerCase();
+  if (v === "r") {
+    removeEntry(key);
+    showInfo(`Removed: ${prettifyKey(key)}`);
+  } else if (v === "" || v === "f") {
+    saveProgress(key, { ...p, finished: true });
+    showInfo(`Marked finished: ${prettifyKey(key)}`);
+  }
 }
 
 function wrapText(text: string, max: number): string[] {
@@ -83,6 +212,61 @@ function wrapText(text: string, max: number): string[] {
   return out.length > 0 ? out : [text];
 }
 
+function hasKitty(): boolean {
+  try {
+    execSync("which kitty", { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function shouldPlayInKitty(): boolean {
+  return !IS_TERMUX && hasKitty() && process.env.PLAYER_PLAY_IN_KITTY === "1";
+}
+
+function showCacheHelp(): void {
+  modalOpen = true;
+  const box = makeModal({ title: "Cache Help", width: "70%", height: 18 });
+  const lines = [
+    "",
+    "  Common fixes:",
+    "  - Slow start: set PLAYER_MIN_BUFFER_KB=128",
+    "  - Timeouts: set PLAYER_CURL_CONNECT_TIMEOUT=30",
+    "  - CDN range bugs: set PLAYER_CURL_DISABLE_RANGE=1",
+    "  - Seek stalls: set PLAYER_DISABLE_SEEK_AHEAD=1",
+    "",
+    "  Current settings:",
+    `  PLAYER_MIN_BUFFER_KB=${process.env.PLAYER_MIN_BUFFER_KB ?? "(default 256)"}`,
+    `  PLAYER_CURL_CONNECT_TIMEOUT=${process.env.PLAYER_CURL_CONNECT_TIMEOUT ?? "(default 20)"}`,
+    `  PLAYER_CURL_RETRY=${process.env.PLAYER_CURL_RETRY ?? "(default 5)"}`,
+    `  PLAYER_CURL_DISABLE_RANGE=${process.env.PLAYER_CURL_DISABLE_RANGE ?? "(default 0)"}`,
+    `  PLAYER_DISABLE_SEEK_AHEAD=${process.env.PLAYER_DISABLE_SEEK_AHEAD ?? "(default 0)"}`,
+    "",
+    `  Log file: ${LOG_PATH}`,
+    "",
+    "  Press any key to close",
+  ];
+  box.setContent(lines.join("\n"));
+  const close = () => { box.destroy(); modalOpen = false; listBox.focus(); screen.render(); };
+  setImmediate(() => {
+    screen.once("keypress", close);
+    box.key(["escape", "q", "enter", "space"], close);
+    box.focus();
+    screen.render();
+  });
+}
+
+const tuiVlcPrompts: VlcPrompts = {
+  yn: async (question: string) => {
+    return confirmDialog(question, "Yes");
+  },
+  ask: async (question: string) => {
+    const ans = await promptText("VLC", question, "");
+    return ans ?? "";
+  },
+};
+
 // ─── STATE ────────────────────────────────────────────────────────────────────
 
 let displayItems: (string | null)[] = []; // null = divider row
@@ -96,6 +280,7 @@ let ignoreEnterUntil = 0;
 let lastKeyShift = false;
 let layoutMode: "wide" | "narrow" = "wide";
 let showDetailInNarrow = false;
+let cacheStatus = "";
 const originalConsole = {
   log: console.log,
   warn: console.warn,
@@ -133,9 +318,11 @@ function formatListItem(key: string | null): string {
   if (key === null) return `{${HINT}-fg}  ── one-time ──{/}`;
   const p = store[key];
   if (!p) return `  ${key}`;
-  const name = prettifyKey(key).padEnd(26).slice(0, 26);
+  const maxName = layoutMode === "narrow" ? 20 : 26;
+  const name = prettifyKey(key).padEnd(maxName).slice(0, maxName);
   const prog = renderProgress(p);
-  const text = `  ${name}  ${prog}`;
+  const spacer = layoutMode === "narrow" ? " " : "  ";
+  const text = `  ${name}${spacer}${prog}`;
   if (p.finished) return `{${FINISHED_FG}-fg}${text}{/}`;
   if (p.episode > 0 || p.timestamp > 0) return `{${WATCHING_FG}-fg}${text}{/}`;
   return `{${NEUTRAL}-fg}${text}{/}`;
@@ -215,13 +402,16 @@ function updateHeader(): void {
 
 function updateFooter(): void {
   if (layoutMode === "narrow") {
+    const cacheHint = cacheStatus ? `  ${cacheStatus}` : "";
     footerBox.setContent(
-      `{${HINT}-fg}  [t] Detail  [/] Search  [n] New  [D] Multi  [q] Quit{/}`
+      `{${HINT}-fg}  [t] Detail  [/] Search  [n] New  [q] Quit{/}\n` +
+      `{${HINT}-fg}  [c] Cache help${cacheHint}{/}`
     );
     return;
   }
+  const cacheHint = cacheStatus ? `  ${cacheStatus}` : "";
   footerBox.setContent(
-    `{${HINT}-fg}  [n] New   [/] Search   [i] Import   [x] Export   [u] Dedupe file   [D] Multi-delete   [q] Quit{/}`
+    `{${HINT}-fg}  [n] New   [/] Search   [i] Import   [x] Export   [u] Dedupe file   [c] Cache help   [D] Multi-delete   [q] Quit${cacheHint}{/}`
   );
 }
 
@@ -301,6 +491,26 @@ function formatConsoleArgs(args: unknown[]): string {
     .slice(0, 240);
 }
 
+function formatCacheStatus(info: {
+  state: string;
+  downloadedBytes: number;
+  totalBytes: number;
+}): string {
+  const mb = (info.downloadedBytes / 1_048_576).toFixed(1);
+  const pct =
+    info.totalBytes > 0
+      ? ` ${(info.downloadedBytes / info.totalBytes * 100).toFixed(1)}%`
+      : "";
+  const state = info.state === "downloading" ? "dl" : info.state;
+  return `Cache:${mb}MB${pct} ${state}`;
+}
+
+function setCacheStatusLine(text: string): void {
+  cacheStatus = text;
+  updateFooter();
+  screen.render();
+}
+
 function appRootDir(): string {
   const script = process.argv[1];
   return script ? dirname(resolve(script)) : process.cwd();
@@ -326,6 +536,13 @@ function applyLayout(): void {
   if (!screen || !listBox || !detailBox) return;
   const narrow = isNarrowLayout();
   layoutMode = narrow ? "narrow" : "wide";
+
+  footerBox.height = (narrow ? 2 : 1) as any;
+  listBox.bottom = (narrow ? 3 : 2) as any;
+  detailBox.bottom = (narrow ? 3 : 2) as any;
+
+  (listBox as any).border = { type: narrow ? "none" : "line" };
+  (detailBox as any).border = { type: narrow ? "none" : "line" };
 
   if (narrow) {
     listBox.width = "100%" as any;
@@ -379,7 +596,7 @@ function setTuiActive(active: boolean): void {
 }
 
 function tryDetachToKitty(scriptPath: string, extraArgs: string[]): boolean {
-  if (process.env.TERM !== "xterm-kitty" && !process.env.KITTY_PID) return false;
+  if (!hasKitty()) return false;
   try {
     const child = spawn(
       "kitty",
@@ -412,52 +629,219 @@ async function playSelected(): Promise<void> {
   if (!p) return;
 
   let playError: string | null = null;
-  setTuiActive(false);
-  (screen as any).leave?.();
+  const playInKitty = shouldPlayInKitty();
+  const vlcPrompts = IS_TERMUX ? tuiVlcPrompts : undefined;
+  if (!playInKitty) {
+    setTuiActive(false);
+    (screen as any).leave?.();
+  }
   try {
-    if (p.isMovie || isDirectVideoUrl(p.url)) {
+    if ((p.isMovie || isDirectVideoUrl(p.url)) && !p.manualUrls?.length) {
+      if (playInKitty) setCacheStatusLine("Cache: starting");
       const result = await playWithMpv(
         MPV, p.url, p.timestamp,
-        (time) => saveProgress(key, { ...(store[key] ?? p), timestamp: time }),
+        (time) => {
+          const cur = store[key] ?? p;
+          saveProgress(key, {
+            ...cur,
+            timestamp: time,
+            cacheOffset: cur.cacheOffset ?? p.cacheOffset,
+          });
+        },
         key,
+        vlcPrompts,
+        {
+          cacheOffsetHint: p.cacheOffset ?? 0,
+          onCache: playInKitty
+            ? (info) => setCacheStatusLine(formatCacheStatus(info))
+            : undefined,
+        },
       );
-      const cur = store[key] ?? p;
+      if (result.finalPosition) {
+        const cur = store[key] ?? p;
+        saveProgress(key, {
+          ...cur,
+          timestamp: result.finalPosition.time,
+          cacheOffset:
+            result.cacheOffset > 0 ? result.cacheOffset : cur.cacheOffset,
+        });
+      }
+      await offerHardsubTui(result.localPath);
+      if (await confirmDialog("Delete local cache file?", "Delete")) {
+        deleteVideoCache(p.url, key);
+      }
       if (result.endReason === "near_end") {
-        saveProgress(key, { ...cur, finished: true, timestamp: 0 });
-      } else if (result.finalPosition) {
-        saveProgress(key, { ...cur, timestamp: result.finalPosition.time });
+        await promptAfterFinishedTui(key, store[key] ?? p);
       }
     } else {
-      // Series: resolve episode list for current season
-      let episodes: string[] = [];
-      if (isDirectVideoUrl(p.url)) episodes = [p.url];
-      else {
-        const seasonUrl = getSeasonUrl(p.url, p.season);
-        episodes = await resolveEpisodes(seasonUrl, p.manualUrls);
-      }
-      if (episodes.length === 0) {
-        showError("No episodes found. Check the URL or add manual URLs.");
-        return;
-      }
-      const epIdx     = p.episode; // 0-based
-      const epUrl     = episodes[epIdx] ?? episodes[0] ?? p.url;
-      const label     = `${prettifyKey(key)} S${p.season}E${String(epIdx + 1).padStart(2, "0")}`;
-      const result    = await playWithMpv(
-        MPV, epUrl, p.timestamp,
-        (time) => saveProgress(key, { ...(store[key] ?? p), timestamp: time }),
-        label,
+      const seasonRaw = await promptText(
+        "Start",
+        "Season (Enter = keep):",
+        String(p.season),
       );
-      const cur = store[key] ?? p;
-      if (result.endReason === "near_end") {
-        const nextEp = epIdx + 1;
-        if (nextEp < episodes.length) {
-          saveProgress(key, { ...cur, episode: nextEp, timestamp: 0 });
+      if (seasonRaw === null) return;
+      const seasonVal = parseInt(seasonRaw.trim(), 10);
+      let season = !isNaN(seasonVal) && seasonVal > 0 ? seasonVal : p.season;
+
+      const epRaw = await promptText(
+        "Start",
+        "Episode (1-based, Enter = keep):",
+        String(p.episode + 1),
+      );
+      if (epRaw === null) return;
+      const epVal = parseInt(epRaw.trim(), 10);
+      let episode = !isNaN(epVal) && epVal > 0 ? epVal - 1 : p.episode;
+
+      if (season !== p.season || episode !== p.episode) {
+        saveProgress(key, { ...(store[key] ?? p), season, episode, timestamp: 0 });
+      }
+
+      const canIterateSeasons =
+        !isDirectVideoUrl(p.url) && getSeasonUrl(p.url, 1) !== getSeasonUrl(p.url, 2);
+
+      while (true) {
+        let episodes: string[] = [];
+        const manualUrls = p.manualUrls ?? [];
+        if (manualUrls.length > 0) {
+          const tagged = manualUrls.filter((u) => /[Ss]\d+[Ee]\d+/.test(u));
+          const seasonUrls = tagged.length
+            ? manualUrls.filter((u) => {
+                const m = (u.split("/").pop() ?? "").match(/[Ss](\d+)[Ee]\d+/);
+                return m ? parseInt(m[1]!, 10) === season : false;
+              })
+            : season === 1 ? manualUrls : [];
+          episodes = sortEpisodeUrls(seasonUrls);
         } else {
-          // Try next season
-          saveProgress(key, { ...cur, season: cur.season + 1, episode: 0, timestamp: 0 });
+          const seasonUrl = getSeasonUrl(p.url, season);
+          episodes = await resolveEpisodes(seasonUrl, p.manualUrls);
         }
-      } else if (result.finalPosition) {
-        saveProgress(key, { ...cur, timestamp: result.finalPosition.time });
+
+        if (episodes.length === 0) {
+          if (canIterateSeasons) {
+            if (!(await confirmDialog(`No episodes for S${season}. Try next season?`, "Next"))) {
+              return;
+            }
+            season += 1;
+            episode = 0;
+            continue;
+          }
+          showError("No episodes found. Check the URL or add manual URLs.");
+          return;
+        }
+
+        if (episode >= episodes.length) episode = 0;
+
+        while (episode < episodes.length) {
+          const epUrl = episodes[episode] ?? p.url;
+          const label = key;
+          const cur = store[key] ?? p;
+          const startTime =
+            cur.season === season && cur.episode === episode ? cur.timestamp : 0;
+          const cacheOffsetHint =
+            cur.season === season && cur.episode === episode
+              ? cur.cacheOffset ?? 0
+              : 0;
+          if (playInKitty) setCacheStatusLine("Cache: starting");
+          const result = await playWithMpv(
+            MPV, epUrl, startTime,
+            (time) => saveProgress(
+              key,
+              {
+                ...(store[key] ?? p),
+                season,
+                episode,
+                timestamp: time,
+                cacheOffset:
+                  cur.season === season && cur.episode === episode
+                    ? cur.cacheOffset
+                    : 0,
+              },
+            ),
+            label,
+            vlcPrompts,
+            {
+              nextEpisodeUrl: episode + 1 < episodes.length
+                ? episodes[episode + 1]!
+                : undefined,
+              cacheOffsetHint,
+              onCache: playInKitty
+                ? (info) => setCacheStatusLine(formatCacheStatus(info))
+                : undefined,
+            },
+          );
+          if (result.finalPosition) {
+            saveProgress(
+              key,
+              {
+                ...(store[key] ?? p),
+                season,
+                episode,
+                timestamp: result.finalPosition.time,
+                cacheOffset:
+                  result.cacheOffset > 0
+                    ? result.cacheOffset
+                    : (store[key] ?? p).cacheOffset,
+              },
+            );
+          }
+          await offerHardsubTui(result.localPath);
+          if (await confirmDialog("Delete local cache file?", "Delete")) {
+            deleteVideoCache(epUrl, key);
+          }
+
+          if (result.endReason !== "near_end") {
+            if (episode + 1 < episodes.length) {
+              if (await confirmDialog(`Play S${season}E${episode + 2} next?`, "Play")) {
+                episode += 1;
+                saveProgress(key, {
+                  ...(store[key] ?? p),
+                  season,
+                  episode,
+                  timestamp: 0,
+                  cacheOffset: 0,
+                });
+                continue;
+              }
+            } else {
+              await promptAfterFinishedTui(key, store[key] ?? p);
+            }
+            return;
+          }
+
+          episode += 1;
+          if (episode >= episodes.length) {
+            if (canIterateSeasons && !p.manualUrls?.length) {
+              const next = await confirmDialog(`Season ${season} done. Continue to Season ${season + 1}?`, "Continue");
+              if (!next) {
+                await promptAfterFinishedTui(key, store[key] ?? p);
+                return;
+              }
+              season += 1;
+              episode = 0;
+              saveProgress(key, {
+                ...(store[key] ?? p),
+                season,
+                episode,
+                timestamp: 0,
+                cacheOffset: 0,
+              });
+              break;
+            }
+            await promptAfterFinishedTui(key, store[key] ?? p);
+            return;
+          }
+
+          saveProgress(key, {
+            ...(store[key] ?? p),
+            season,
+            episode,
+            timestamp: 0,
+            cacheOffset: 0,
+          });
+          if (!(await confirmDialog(`Play S${season}E${episode + 1} next?`, "Play"))) {
+            return;
+          }
+        }
       }
     }
     schedulePush();
@@ -465,10 +849,11 @@ async function playSelected(): Promise<void> {
     playError = (e as Error).message || "Playback failed";
   }
 
-  (screen as any).enter?.();
+  if (!playInKitty) (screen as any).enter?.();
   refreshList();
   listBox.focus();
-  setTuiActive(true);
+  if (!playInKitty) setTuiActive(true);
+  if (playInKitty) setCacheStatusLine("");
   if (playError) showError(playError);
   screen.render();
 }
@@ -634,7 +1019,9 @@ function confirmDialog(msg: string, yesLabel = "Confirm"): Promise<boolean> {
 async function showNewEntryModal(): Promise<void> {
   const url = await promptText("New Entry", "URL:");
   if (!url) return;
-  const suggested = sanitiseKey(url.split("\n")[0].trim());
+  const urls = parseUrlInput(url);
+  if (urls.length === 0) { showError("No URL provided"); return; }
+  const suggested = sanitiseKey(urls[0]);
   const name = await promptText("New Entry", "Name:", suggested);
   if (name === null) return;
   const key = (sanitiseKey(name) || suggested).trim();
@@ -643,11 +1030,10 @@ async function showNewEntryModal(): Promise<void> {
     const ok = await confirmDialog(`"${key}" already exists. Overwrite?`, "Overwrite");
     if (!ok) return;
   }
-  const urls    = url.split("\n").map((u) => u.trim()).filter(Boolean);
   const firstUrl = urls[0];
   const p: SeriesProgress = {
     url: firstUrl, season: 1, episode: 0, timestamp: 0,
-    isMovie: isDirectVideoUrl(firstUrl),
+    isMovie: urls.length > 1 ? false : isDirectVideoUrl(firstUrl),
     manualUrls: urls.length > 1 ? urls : undefined,
   };
   saveProgress(key, p);
@@ -670,7 +1056,19 @@ async function showEditModal(): Promise<void> {
   if (newName === null) return;
   const newUrl = await promptText("Edit — URL", "URL:", p.url);
   if (newUrl === null) return;
-  if (newUrl) p.url = newUrl;
+  if (newUrl.trim()) {
+    const urls = parseUrlInput(newUrl);
+    if (urls.length > 0) {
+      p.url = urls[0];
+      if (urls.length > 1) {
+        p.manualUrls = urls;
+        p.isMovie = false;
+      } else {
+        p.manualUrls = undefined;
+        p.isMovie = isDirectVideoUrl(urls[0]);
+      }
+    }
+  }
 
   if (!p.isMovie && !p.isOnetime) {
     const sv = await promptText("Edit — Season", "Season:", String(p.season));
@@ -1064,7 +1462,7 @@ function forceSync(): void {
 
 function showHelp(): void {
   modalOpen = true;
-  const box = makeModal({ title: "Help", width: "52%", height: 27 });
+  const box = makeModal({ title: "Help", width: "52%", height: 28 });
   box.setContent([
     "",
     `  {${ACCENT}-fg}Navigation{/}`,
@@ -1087,6 +1485,7 @@ function showHelp(): void {
     `  {${HINT}-fg}i{/}           Import from file`,
     `  {${HINT}-fg}x{/}           Export to file`,
     `  {${HINT}-fg}u{/}           Dedupe series JSON file`,
+    `  {${HINT}-fg}c{/}           Cache help`,
     `  {${HINT}-fg}s{/}           Force sync`,
     `  {${HINT}-fg}q / Esc{/}     Quit`,
     "",
@@ -1151,6 +1550,7 @@ function bindKeys(): void {
   screen.key(["i"],     guard(showImportModal));
   screen.key(["x"],     guard(showExportModal));
   screen.key(["u"],     guard(showDedupeModal));
+  screen.key(["c"],     guard(showCacheHelp));
   screen.key(["s"],     guard(forceSync));
   screen.key(["?"],     guard(showHelp));
   screen.key(["t"], guard(() => {
@@ -1252,9 +1652,20 @@ function buildLayout(): void {
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  process.on("uncaughtException", (err) => {
+    logToFile(`uncaughtException: ${err?.stack || err}`);
+  });
+  process.on("unhandledRejection", (err) => {
+    logToFile(`unhandledRejection: ${String(err)}`);
+  });
+  logToFile("TUI start");
   const args = process.argv.slice(2);
   const wantsDetach = args.includes("--detach");
   const isDetached = args.includes("--detached") || process.env.PLAYER_TUI_DETACHED === "1";
+  if (!IS_TERMUX && hasKitty()) {
+    process.env.PLAYER_PLAY_IN_KITTY = "1";
+    process.env.PLAYER_MPV_NO_TERMINAL = "1";
+  }
   if (wantsDetach && !isDetached) {
     const scriptPath = resolve(process.argv[1] ?? "tui.ts");
     const extraArgs = args.filter((a) => a !== "--detach");
@@ -1305,6 +1716,7 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
+  logToFile(`main.catch: ${e?.stack || e}`);
   console.error("TUI error:", e);
   process.exit(1);
 });

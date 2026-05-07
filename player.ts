@@ -19,9 +19,6 @@ import {
   flushSync,
   schedulePush,
   playWithMpv,
-  startDownload,
-  videoCachePath,
-  videoFileSize,
   deleteVideoCache,
   renderProgress,
   formatTime,
@@ -45,7 +42,6 @@ import {
   QuitToMenu,
   fuzzyMatch,
   clearEpisodeCache,
-  prefetchEpisode,
   cleanFilename,
   findMpv,
 } from "./player-core.js";
@@ -1049,10 +1045,16 @@ export async function runSession(MPV: string, args: string[]) {
       p.url,
       p.timestamp,
       (time) => {
-        saveProgress(key, { ...p, timestamp: time });
+        const cur = store[key] ?? p;
+        saveProgress(key, {
+          ...cur,
+          timestamp: time,
+          cacheOffset: cur.cacheOffset ?? p.cacheOffset,
+        });
       },
       key,
       cliPrompts,
+      { cacheOffsetHint: p.cacheOffset ?? 0 },
     );
     await offerHardsub(result.localPath);
     const del = await promptYNSoft("Delete local cache file? [Y/n]: ");
@@ -1061,9 +1063,12 @@ export async function runSession(MPV: string, args: string[]) {
       console.log(`\n✓  ${key} — finished!`);
       await promptAfterFinished(key, store[key] ?? p);
     } else if (result.finalPosition) {
+      const cur = store[key] ?? p;
       saveProgress(key, {
-        ...(store[key] ?? p),
+        ...cur,
         timestamp: result.finalPosition.time,
+        cacheOffset:
+          result.cacheOffset > 0 ? result.cacheOffset : cur.cacheOffset,
       });
       console.log(
         `\nStopped at: ${formatTime(result.finalPosition.time)}${result.finalPosition.duration > 0 ? ` / ${formatTime(result.finalPosition.duration)}` : ""}`,
@@ -1160,10 +1165,12 @@ export async function runSession(MPV: string, args: string[]) {
       while (ce < eps.length) {
         const eu = eps[ce]!;
         console.log(`\n--- Season ${cs}, Episode ${ce + 1} ---`);
-        if (ce + 1 < eps.length) prefetchEpisode(eps[ce + 1]!, key);
         const st = rt;
         rt = 0;
         let ls = Date.now();
+        const cur = store[key] ?? p;
+        const cacheOffsetHint =
+          cur.season === cs && cur.episode === ce ? cur.cacheOffset ?? 0 : 0;
         const result = await playWithMpv(
           MPV,
           eu,
@@ -1176,21 +1183,33 @@ export async function runSession(MPV: string, args: string[]) {
                 season: cs,
                 episode: ce,
                 timestamp: time,
+                cacheOffset:
+                  cur.season === cs && cur.episode === ce
+                    ? cur.cacheOffset
+                    : 0,
               });
             }
           },
           key,
           cliPrompts,
+          {
+            nextEpisodeUrl: ce + 1 < eps.length ? eps[ce + 1]! : undefined,
+            cacheOffsetHint,
+          },
         );
 
         const { finalPosition, endReason, localPath } = result;
-        if (finalPosition)
+        if (finalPosition) {
+          const sp = store[key]!;
           saveProgress(key, {
-            ...store[key]!,
+            ...sp,
             season: cs,
             episode: ce,
             timestamp: finalPosition.time,
+            cacheOffset:
+              result.cacheOffset > 0 ? result.cacheOffset : sp.cacheOffset,
           });
+        }
 
         await offerHardsub(localPath);
         const del = await promptYNSoft("Delete local cache file? [Y/n]: ");
@@ -1206,6 +1225,7 @@ export async function runSession(MPV: string, args: string[]) {
                 season: cs,
                 episode: ce - 1,
                 timestamp: 0,
+                cacheOffset: 0,
               });
               break outer;
             }
@@ -1217,6 +1237,7 @@ export async function runSession(MPV: string, args: string[]) {
               season: cs,
               episode: 0,
               timestamp: 0,
+              cacheOffset: 0,
             });
             if (!(await promptYNSoft(`Continue to Season ${cs}? [Y/n]: `))) {
               await flushSync();
@@ -1229,6 +1250,7 @@ export async function runSession(MPV: string, args: string[]) {
             season: cs,
             episode: ce,
             timestamp: 0,
+            cacheOffset: 0,
           });
           console.log("\n✓ Episode done.");
           if (!(await promptYNSoft(`Play S${cs}E${ce + 1} next? [Y/n]: `))) {

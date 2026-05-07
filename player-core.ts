@@ -15,6 +15,7 @@ import {
 import { homedir } from "os";
 import { join } from "path";
 import net from "net";
+import { CacheManager } from "./cache-manager.js";
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 process.removeAllListeners("warning");
@@ -56,6 +57,7 @@ export interface SeriesProgress {
   isOnetime?: boolean;
   overview?: string;
   genres?: string[];
+  cacheOffset?: number;
 }
 
 export type ProgressStore = Record<string, SeriesProgress>;
@@ -68,10 +70,6 @@ export const ARVAN_REGION = process.env.PLAYER_ARVAN_REGION || "ir-thr-at1";
 export const ARVAN_FILE = "mpv-progress.json";
 export const ARVAN_SYNC = !!(ARVAN_ACCESS && ARVAN_SECRET && ARVAN_BUCKET);
 
-export const CONFIG_DIR = join(homedir(), ".mpv-web-player");
-export const CACHE_DIR = join(CONFIG_DIR, "cache");
-export const PROGRESS_FILE = join(CONFIG_DIR, "progress.json");
-
 export const SCRIPT_DIR = (() => {
   try {
     const p = process.argv[1];
@@ -82,12 +80,20 @@ export const SCRIPT_DIR = (() => {
   } catch {}
   return process.cwd();
 })();
+export const CONFIG_DIR =
+  process.env.PLAYER_CONFIG_DIR || join(SCRIPT_DIR, ".mpv-web-player");
+export const CACHE_DIR = join(CONFIG_DIR, "cache");
+export const PROGRESS_FILE = join(CONFIG_DIR, "progress.json");
 export const VIDEO_DIR = join(SCRIPT_DIR, "video-cache");
 export const MPV_SOCKET = join(CONFIG_DIR, "mpv.sock");
 
 export const IS_TERMUX =
   process.env.PREFIX?.includes("com.termux") ||
   existsSync("/data/data/com.termux");
+export const TERMUX_VIDEO_DIR = IS_TERMUX
+  ? process.env.PLAYER_TERMUX_VIDEO_DIR ||
+    (existsSync("/sdcard") ? "/sdcard/player-cache" : VIDEO_DIR)
+  : VIDEO_DIR;
 export const END_THRESHOLD_SECONDS = 60;
 export const END_THRESHOLD_RATIO = 0.95;
 
@@ -619,9 +625,10 @@ export function videoCachePath(episodeUrl: string, seriesLabel = ""): string {
   const filename = decodeURIComponent(
     episodeUrl.split("/").pop()!.split("?")[0],
   );
+  const baseDir = IS_TERMUX ? TERMUX_VIDEO_DIR : VIDEO_DIR;
   const dir = seriesLabel
-    ? join(VIDEO_DIR, sanitiseDirName(seriesLabel))
-    : VIDEO_DIR;
+    ? join(baseDir, sanitiseDirName(seriesLabel))
+    : baseDir;
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   return join(dir, filename);
 }
@@ -698,6 +705,14 @@ export async function queryMpv(): Promise<{
 // startDownload auto-retries on exit 18 up to MAX_DOWNLOAD_RETRIES times,
 // resuming from current file size each time so mpv keeps playing uninterrupted.
 export const MAX_DOWNLOAD_RETRIES = 20;
+const CURL_CONNECT_TIMEOUT = Number(process.env.PLAYER_CURL_CONNECT_TIMEOUT ?? "20");
+const CURL_RETRY = Number(process.env.PLAYER_CURL_RETRY ?? "5");
+const CURL_RETRY_DELAY = Number(process.env.PLAYER_CURL_RETRY_DELAY ?? "3");
+const CURL_DISABLE_RANGE = process.env.PLAYER_CURL_DISABLE_RANGE === "1";
+const DISABLE_SEEK_AHEAD = process.env.PLAYER_DISABLE_SEEK_AHEAD === "1";
+const STREAM_FALLBACK = process.env.PLAYER_STREAM_FALLBACK !== "0";
+const MIN_BUFFER_KB = Number(process.env.PLAYER_MIN_BUFFER_KB ?? "256");
+const MPV_NO_TERMINAL = process.env.PLAYER_MPV_NO_TERMINAL !== "0";
 
 export function startDownload(
   episodeUrl: string,
@@ -705,10 +720,7 @@ export function startDownload(
   byteOffset = 0,
   onComplete?: () => void,
 ): ChildProcess {
-  if (byteOffset > 0 && existsSync(localPath))
-    try {
-      unlinkSync(localPath);
-    } catch {}
+  // Keep existing partial files so we can resume when the server supports Range.
 
   let attempt = 0;
   let currentProcess: ChildProcess;
@@ -718,8 +730,25 @@ export function startDownload(
     // Only pass -C <offset> when we have a real byte offset to resume from.
     // On the first attempt (offset=0) we omit -C entirely — some Iranian CDN
     // servers mishandle Range requests and stall or corrupt the download.
-    const curlArgs = ["-L", "-k", "--silent", "--show-error", "-o", localPath];
-    if (offset > 0) curlArgs.push("-C", String(offset));
+    const curlArgs = [
+      "-L",
+      "-k",
+      "--silent",
+      "--show-error",
+      "--connect-timeout",
+      String(CURL_CONNECT_TIMEOUT),
+      "--retry",
+      String(CURL_RETRY),
+      "--retry-all-errors",
+      "--retry-connrefused",
+      "--retry-delay",
+      String(CURL_RETRY_DELAY),
+      "-A",
+      "Mozilla/5.0",
+      "-o",
+      localPath,
+    ];
+    if (offset > 0 && !CURL_DISABLE_RANGE) curlArgs.push("-C", String(offset));
     curlArgs.push(episodeUrl);
     const proc = spawn("curl", curlArgs, {
       stdio: ["ignore", "ignore", "pipe"],
@@ -741,7 +770,7 @@ export function startDownload(
       }
       // Error 18: partial transfer — server dropped the connection early.
       // Resume from wherever the file currently ends.
-      if (code === 18 && attempt < MAX_DOWNLOAD_RETRIES) {
+      if ((code === 18 || code === 28) && attempt < MAX_DOWNLOAD_RETRIES) {
         attempt++;
         const sz = videoFileSize(localPath);
         console.warn(
@@ -823,7 +852,21 @@ export type PlayResult = {
   finalPosition: { time: number; duration: number } | null;
   endReason: "near_end" | "quit";
   localPath: string;
+  cacheOffset: number;
 };
+
+export interface PlayOptions {
+  nextEpisodeUrl?: string;
+  cacheOffsetHint?: number;
+  onCache?: (info: CacheStatus) => void;
+  showMpvCacheOsd?: boolean;
+}
+
+export interface CacheStatus {
+  state: "buffering" | "downloading" | "retrying" | "complete" | "error";
+  downloadedBytes: number;
+  totalBytes: number;
+}
 
 export function isNearEnd(t: number, d: number) {
   return (
@@ -837,6 +880,7 @@ export function playWithMpvDesktop(
   startTime = 0,
   onProgress?: (t: number, d: number) => void,
   seriesLabel = "",
+  options?: PlayOptions,
 ): Promise<PlayResult> {
   return new Promise((resolve) => {
     if (existsSync(MPV_SOCKET))
@@ -851,72 +895,81 @@ export function playWithMpvDesktop(
         : "[cache] Starting download…",
     );
     // onDlComplete is set after sendMpvCmd is in scope (inside waitForFile.then)
-    let onDlComplete: () => void = () => {};
-    let downloader = startDownload(episodeUrl, localPath, 0, () =>
-      onDlComplete(),
-    );
+    let onDlComplete: () => void = () => {
+      downloadComplete = true;
+    };
     let downloadComplete = false,
       totalFileBytes = 0,
-      fileBytesPerVideoSec = 0;
-    fetch(episodeUrl, { method: "HEAD" })
-      .then((r) => {
-        const cl = r.headers.get("content-length");
-        if (cl) totalFileBytes = parseInt(cl, 10);
-      })
-      .catch(() => {});
+      fileBytesPerVideoSec = 0,
+      cacheBytes = alreadyBytes,
+      cacheState: CacheStatus["state"] = "buffering";
+    const cm = new CacheManager({
+      connectTimeoutSec: CURL_CONNECT_TIMEOUT,
+      userAgent: "Mozilla/5.0",
+      disableRange: CURL_DISABLE_RANGE,
+    });
+    cm.on("progress", (bytes: number, total: number, slotIndex: number) => {
+      if (slotIndex !== 0) return;
+      cacheBytes = bytes;
+      if (total > 0) totalFileBytes = total;
+      if (total > 0 && bytes >= total) downloadComplete = true;
+      options?.onCache?.({
+        state: cacheState,
+        downloadedBytes: cacheBytes,
+        totalBytes: totalFileBytes,
+      });
+    });
+    cm.on("state", (state: CacheStatus["state"], slotIndex: number) => {
+      if (slotIndex !== 0) return;
+      cacheState = state;
+      options?.onCache?.({
+        state: cacheState,
+        downloadedBytes: cacheBytes,
+        totalBytes: totalFileBytes,
+      });
+    });
+    cm.on("error", (msg: string, slotIndex: number) => {
+      if (slotIndex === 0) console.warn(msg);
+    });
     // Wait until the file has at least 512 KB on disk before giving it to mpv.
     // Waiting for >0 bytes is not enough — mpv needs a valid container header
     // which for MKV/MP4 can be several hundred KB into the file.
-    const MIN_BYTES_BEFORE_PLAY = 512 * 1024;
-    const waitForFile = () =>
-      new Promise<void>((res) => {
-        if (
-          existsSync(localPath) &&
-          videoFileSize(localPath) >= MIN_BYTES_BEFORE_PLAY
-        )
-          return res();
-        let elapsed = 0;
-        const iv = setInterval(() => {
-          elapsed += 200;
-          const sz = videoFileSize(localPath);
-          if (sz >= MIN_BYTES_BEFORE_PLAY) {
-            clearInterval(iv);
-            res();
-            return;
-          }
-          // Show progress every 2 s while waiting
-          if (elapsed % 2000 === 0 && sz > 0)
-            process.stdout.write(
-              `\r[cache] Buffering… ${(sz / 1024).toFixed(0)} KB / ${(MIN_BYTES_BEFORE_PLAY / 1024).toFixed(0)} KB`,
-            );
-          // Give up after 60 s to avoid hanging forever on a dead URL
-          if (elapsed >= 60_000) {
-            clearInterval(iv);
-            if (sz > 0) process.stdout.write("\n");
-            res();
-          }
-        }, 200);
-      });
-    waitForFile()
+    const MIN_BYTES_BEFORE_PLAY = Math.max(64, MIN_BUFFER_KB) * 1024;
+    cm.startCurrent(
+      episodeUrl,
+      localPath,
+      options?.cacheOffsetHint ?? 0,
+      MIN_BYTES_BEFORE_PLAY,
+      () => onDlComplete(),
+    )
+      .then(({ bufferReady }) => bufferReady)
       .then(() => {
-        if (videoFileSize(localPath) === 0) {
+        const fileSize = videoFileSize(localPath);
+        let playbackTarget = localPath;
+        let useCache = true;
+        if (fileSize === 0) {
           console.error(
             "\n[cache] File still empty after 60 s — check URL or network.",
           );
-          try {
-            downloader.kill();
-          } catch {}
-          resolve({
-            exitCode: null,
-            finalPosition: null,
-            endReason: "quit",
-            localPath,
-          });
-          return;
+          cm.killAll();
+          if (!STREAM_FALLBACK) {
+            resolve({
+              exitCode: null,
+              finalPosition: null,
+              endReason: "quit",
+              localPath,
+              cacheOffset: 0,
+            });
+            return;
+          }
+          console.warn("[cache] Falling back to direct stream (no cache).");
+          playbackTarget = episodeUrl;
+          useCache = false;
         }
-        if (videoFileSize(localPath) >= MIN_BYTES_BEFORE_PLAY)
+        if (useCache && fileSize >= MIN_BYTES_BEFORE_PLAY)
           process.stdout.write("\n");
         const args = [
+          ...(MPV_NO_TERMINAL ? ["--no-terminal"] : []),
           "--no-resume-playback",
           `--input-ipc-server=${MPV_SOCKET}`,
           "--force-window=immediate",
@@ -928,18 +981,36 @@ export function playWithMpvDesktop(
           "--cache-secs=30",
         ];
         if (startTime > 0) args.push(`--start=${startTime}`);
-        args.push(localPath);
+        args.push(playbackTarget);
         console.log(`\nPlaying: ${cleanFilename(localPath)}`);
         if (startTime > 0)
           console.log(`Resuming from: ${formatTime(startTime)}`);
-        const mpv = spawn(MPV, args, {
-          stdio: ["inherit", "inherit", "inherit"],
-        });
+        const mpv = (() => {
+          if (process.env.PLAYER_PLAY_IN_KITTY === "1") {
+            try {
+              execSync("which kitty", { stdio: "ignore" });
+              return spawn(
+                "kitty",
+                ["--title", "player", "--directory", process.cwd(), "--", MPV, ...args],
+                { stdio: ["ignore", "ignore", "ignore"] },
+              );
+            } catch {}
+          }
+          return spawn(MPV, args, { stdio: ["inherit", "inherit", "inherit"] });
+        })();
+        if (useCache && options?.nextEpisodeUrl) {
+          cm.startPrefetch(
+            options.nextEpisodeUrl,
+            videoCachePath(options.nextEpisodeUrl, seriesLabel),
+          );
+        }
         let lastPosition: { time: number; duration: number } | null = null;
         let socketReady = false,
           markedNearEnd = false,
           isPaused = false,
           seekCheckDone = false;
+        let lastOsdAt = 0;
+        let lastOsdText = "";
         const socketCheck = setInterval(() => {
           if (existsSync(MPV_SOCKET)) {
             socketReady = true;
@@ -963,6 +1034,7 @@ export function playWithMpvDesktop(
             500,
           );
         };
+        if (downloadComplete) onDlComplete();
         const poll = setInterval(async () => {
           if (!socketReady) return;
           const pos = await queryMpv();
@@ -984,6 +1056,7 @@ export function playWithMpvDesktop(
             startTime > 0
           ) {
             seekCheckDone = true;
+            if (DISABLE_SEEK_AHEAD) return;
             const needed = startTime * fileBytesPerVideoSec;
             const current = videoFileSize(localPath);
             if (current < needed * 0.85) {
@@ -991,19 +1064,18 @@ export function playWithMpvDesktop(
               console.log(
                 `[cache] Seek ahead — restarting curl from ${formatTime(startTime)}`,
               );
-              try {
-                downloader.kill();
-              } catch {}
+              cm.killAll();
               downloadComplete = false;
-              downloader = startDownload(
+              cm.startCurrent(
                 episodeUrl,
                 localPath,
                 offset,
-                onDlComplete,
-              );
+                MIN_BYTES_BEFORE_PLAY,
+                () => onDlComplete(),
+              ).catch(() => {});
             }
           }
-          if (!downloadComplete && fileBytesPerVideoSec > 0 && !markedNearEnd) {
+          if (useCache && !downloadComplete && fileBytesPerVideoSec > 0 && !markedNearEnd) {
             const dlSec =
               (startTime > 0 && seekCheckDone
                 ? Math.max(0, startTime - 2)
@@ -1021,8 +1093,32 @@ export function playWithMpvDesktop(
               isPaused = false;
               sendMpvCmd({ command: ["set_property", "pause", false] });
               console.log("[buffer] Ready — resuming.");
+            if (options?.showMpvCacheOsd !== false && useCache) {
+              const now = Date.now();
+              if (now - lastOsdAt > 3000) {
+                const pct =
+                  totalFileBytes > 0
+                    ? ` ${(cacheBytes / totalFileBytes * 100).toFixed(1)}%`
+                    : "";
+                const mb = (cacheBytes / 1_048_576).toFixed(1);
+                const mbTotal =
+                  totalFileBytes > 0
+                    ? ` / ${(totalFileBytes / 1_048_576).toFixed(1)} MB`
+                    : "";
+                const secs =
+                  fileBytesPerVideoSec > 0
+                    ? ` ~${formatTime(Math.floor(cacheBytes / fileBytesPerVideoSec))}`
+                    : "";
+                const text = `Cache: ${mb} MB${mbTotal}${pct}${secs} (${cacheState})`;
+                if (text !== lastOsdText) {
+                  lastOsdText = text;
+                  lastOsdAt = now;
+                  sendMpvCmd({ command: ["show-text", text, 2000] });
+                }
+              }
             }
-          } else if (isPaused) {
+            }
+          } else if (useCache && isPaused) {
             isPaused = false;
             sendMpvCmd({ command: ["set_property", "pause", false] });
           }
@@ -1034,9 +1130,7 @@ export function playWithMpvDesktop(
             try {
               unlinkSync(MPV_SOCKET);
             } catch {}
-          try {
-            downloader.kill();
-          } catch {}
+          cm.killAll();
           const nearEnd =
             markedNearEnd ||
             (lastPosition !== null &&
@@ -1046,19 +1140,19 @@ export function playWithMpvDesktop(
             finalPosition: lastPosition,
             endReason: nearEnd ? "near_end" : "quit",
             localPath,
+            cacheOffset: useCache ? cm.currentOffset(0) : 0,
           });
         });
       })
       .catch((err) => {
         console.error(`[cache] ${err.message}`);
-        try {
-          downloader.kill();
-        } catch {}
+        cm.killAll();
         resolve({
           exitCode: null,
           finalPosition: null,
           endReason: "quit",
           localPath: videoCachePath(episodeUrl, seriesLabel),
+          cacheOffset: 0,
         });
       });
   });
@@ -1113,7 +1207,7 @@ export async function playWithVlcAndroid(
     if (existsSync(localPath) && videoFileSize(localPath) >= 2_097_152) break;
   }
 
-  const fileUri = `file://${localPath}`;
+  const fileUri = encodeURI(`file://${localPath}`);
   const posMs = Math.floor(startTime * 1000);
   const extras =
     posMs > 0
@@ -1166,6 +1260,7 @@ export async function playWithVlcAndroid(
       finalPosition: null,
       endReason: "near_end",
       localPath,
+      cacheOffset: videoFileSize(localPath),
     };
   }
   const raw = prompts
@@ -1180,6 +1275,7 @@ export async function playWithVlcAndroid(
     finalPosition: { time: secs > 0 ? secs : startTime || 1, duration: 0 },
     endReason: "quit",
     localPath,
+    cacheOffset: videoFileSize(localPath),
   };
 }
 
@@ -1201,10 +1297,18 @@ export async function playWithMpv(
   onProgress?: (t: number, d: number) => void,
   seriesLabel = "",
   prompts?: VlcPrompts,
+  options?: PlayOptions,
 ): Promise<PlayResult> {
   return IS_TERMUX
     ? playWithVlcAndroid(episodeUrl, startTime, seriesLabel, prompts)
-    : playWithMpvDesktop(MPV, episodeUrl, startTime, onProgress, seriesLabel);
+    : playWithMpvDesktop(
+        MPV,
+        episodeUrl,
+        startTime,
+        onProgress,
+        seriesLabel,
+        options,
+      );
 }
 
 // ─── DIRECTORY LISTING ───────────────────────────────────────────────────────

@@ -11,6 +11,7 @@ Terminal-first media player with a fast TUI, a CLI mode, local progress tracking
 - Manual URL lists (paste multiple episode URLs)
 - Local caching and background prefetch
 - Download resume with retry on partial transfers
+- Cache progress shown in mpv (desktop)
 - Delete local cache files
 - Hardsub export helper (if `stoh` + `ffprobe` are installed)
 - Import/export to the series-project JSON format
@@ -84,11 +85,26 @@ When the terminal is narrow (e.g. Termux), the UI switches to a single-column la
 - `Tab` toggles between list and detail panels
 - All actions still work, just in a stacked view
 
+Playback on Android uses VLC via Intent:
+
+- When VLC closes, the app asks if you finished the episode.
+- If not finished, it asks for the stop time so progress can be saved.
+- VLC does not support mpv IPC, so cache OSD is not available there.
+
+To let VLC open local cache files, make sure Termux storage is enabled:
+
+```bash
+termux-setup-storage
+```
+
 ## Data & Files
 
-- Progress is stored in `~/.mpv-web-player/progress.json`
-- Cache directory: `~/.mpv-web-player/cache`
+- Progress is stored in `<project>/.mpv-web-player/progress.json`
+- Cache directory: `<project>/.mpv-web-player/cache`
 - Video cache: `video-cache/` in the project folder
+- Override config root with `PLAYER_CONFIG_DIR=/path/to/dir`
+- On Termux, video cache defaults to `/sdcard/player-cache` so VLC can access it.
+- Override Termux video cache with `PLAYER_TERMUX_VIDEO_DIR=/sdcard/YourFolder`
 - Import/export uses the series-project JSON array format
 
 ## Import/Export
@@ -148,6 +164,11 @@ Playback is always done from a local file in `video-cache/` (project folder). Th
 - Playback starts only after a small buffer is present on disk so the container header is valid.
 - The file grows as `curl` downloads more data.
 
+Cache progress is reported while playing:
+
+- Desktop mpv shows a small on-screen message with MB/percent/state.
+- The TUI footer shows cache status while playing in a separate Kitty window.
+
 If the local file already exists, the player uses it and reports how many MB are already on disk.
 
 ### Resume behavior
@@ -159,6 +180,8 @@ Resume is driven by `timestamp` in the progress store:
 
 For series, the current episode index and timestamp are saved. When an episode ends near the end (within the threshold), the player advances to the next episode and resets timestamp to 0.
 
+The cache offset (bytes written so far) is also stored so a download can resume after restarts.
+
 ### Download retries and buffer control
 
 The downloader uses `curl` and retries on partial transfers (exit 18):
@@ -166,11 +189,13 @@ The downloader uses `curl` and retries on partial transfers (exit 18):
 - If the server drops the connection, `curl` restarts from the current file size.
 - The player keeps playing from the same local file while downloads resume.
 
+Retries use exponential backoff and keep trying for the current episode.
+
 The TUI/CLI polling loop checks how many seconds are downloaded versus current playback time. If playback is about to outrun the download, it pauses mpv and resumes once enough data is buffered.
 
 ### Prefetch
 
-While you are watching episode N, the player prefetches episode N+1 in the background to reduce wait time for the next episode.
+While you are watching episode N, the player prefetches episode N+1 in the background to reduce wait time for the next episode (starts as soon as playback begins).
 
 ### Deleting cache
 
