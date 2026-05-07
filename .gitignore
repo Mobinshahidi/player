@@ -1,0 +1,6 @@
+backups/
+video-cache/
+node-modules
+node_modules
+.mpv-player-secrets
+progress-export.json
