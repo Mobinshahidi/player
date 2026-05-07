@@ -76,6 +76,14 @@ npx tsx player.ts import /path/to/series.json
 - `s`: force sync
 - `q`: quit
 
+## Mobile / Termux
+
+When the terminal is narrow (e.g. Termux), the UI switches to a single-column layout:
+
+- The list fills the screen
+- `Tab` toggles between list and detail panels
+- All actions still work, just in a stacked view
+
 ## Data & Files
 
 - Progress is stored in `~/.mpv-web-player/progress.json`

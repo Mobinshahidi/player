@@ -63,6 +63,26 @@ function prettifyKey(key: string): string {
   return key.replace(/[._-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase()).trim();
 }
 
+function wrapText(text: string, max: number): string[] {
+  const out: string[] = [];
+  const words = text.split(/\s+/).filter(Boolean);
+  let line = "";
+  for (const w of words) {
+    if (!line) {
+      line = w;
+      continue;
+    }
+    if ((line + " " + w).length > max) {
+      out.push(line);
+      line = w;
+    } else {
+      line += " " + w;
+    }
+  }
+  if (line) out.push(line);
+  return out.length > 0 ? out : [text];
+}
+
 // ─── STATE ────────────────────────────────────────────────────────────────────
 
 let displayItems: (string | null)[] = []; // null = divider row
@@ -73,6 +93,9 @@ let errorTimer: ReturnType<typeof setTimeout> | null = null;
 let MPV = "";
 let tuiActive = false;
 let ignoreEnterUntil = 0;
+let lastKeyShift = false;
+let layoutMode: "wide" | "narrow" = "wide";
+let showDetailInNarrow = false;
 const originalConsole = {
   log: console.log,
   warn: console.warn,
@@ -179,12 +202,24 @@ function updateHeader(): void {
     sync = `  {${col}-fg}[sync: ${sym}]{/}`;
   }
   const total = Object.keys(store).length;
+  if (layoutMode === "narrow") {
+    headerBox.setContent(
+      `{bold}{${ACCENT}-fg} player{/}{/}  {${HINT}-fg}[${total}]{/}${sync}`,
+    );
+    return;
+  }
   headerBox.setContent(
     `{bold}{${ACCENT}-fg}  🎬  player{/}{/}${sync}   {${HINT}-fg}[total: ${total}]  [/] Search  [?] Help{/}`
   );
 }
 
 function updateFooter(): void {
+  if (layoutMode === "narrow") {
+    footerBox.setContent(
+      `{${HINT}-fg}  [t] Detail  [/] Search  [n] New  [D] Multi  [q] Quit{/}`
+    );
+    return;
+  }
   footerBox.setContent(
     `{${HINT}-fg}  [n] New   [/] Search   [i] Import   [x] Export   [u] Dedupe file   [D] Multi-delete   [q] Quit{/}`
   );
@@ -200,6 +235,9 @@ function updateDetail(): void {
   const ts     = p.timestamp > 0 ? formatTime(p.timestamp) : "—";
   const maxUrl = Math.max(10, (detailBox.width as number) - 6);
   const url    = p.url.length > maxUrl ? p.url.slice(0, maxUrl - 1) + "…" : p.url;
+  const maxText = Math.max(10, (detailBox.width as number) - 6);
+  const genres = p.genres && p.genres.length > 0 ? p.genres.join(", ") : "";
+  const overview = p.overview ?? "";
   const upd    = relativeTime(p.updatedAt);
   const fStr   = p.finished
     ? `{${FINISHED_FG}-fg}✓ Finished{/}`
@@ -217,6 +255,17 @@ function updateDetail(): void {
       : []),
     `  {${HINT}-fg}Time    {/}  ${ts}`,
     `  {${HINT}-fg}URL     {/}  {${NEUTRAL}-fg}${url}{/}`,
+    ...(genres
+      ? [`  {${HINT}-fg}Genres  {/}  {${NEUTRAL}-fg}${genres}{/}`]
+      : []),
+    ...(overview
+      ? [
+          `  {${HINT}-fg}Overview{/}  {${NEUTRAL}-fg}${wrapText(overview, maxText)[0]}{/}`,
+          ...wrapText(overview, maxText).slice(1).map(
+            (line) => `  {${NEUTRAL}-fg}${line}{/}`,
+          ),
+        ]
+      : []),
     ...(p.manualUrls?.length ? [`  {${HINT}-fg}URLs    {/}  ${p.manualUrls.length} manual`] : []),
     ...(upd ? [`  {${HINT}-fg}Updated {/}  ${upd}`] : []),
     "",
@@ -266,6 +315,48 @@ function resolveInAppPath(inputPath: string): string {
 
 function shouldIgnoreEnter(): boolean {
   return Date.now() < ignoreEnterUntil;
+}
+
+function isNarrowLayout(): boolean {
+  const w = Number(screen?.width ?? 0);
+  return w > 0 && w < 90;
+}
+
+function applyLayout(): void {
+  if (!screen || !listBox || !detailBox) return;
+  const narrow = isNarrowLayout();
+  layoutMode = narrow ? "narrow" : "wide";
+
+  if (narrow) {
+    listBox.width = "100%" as any;
+    detailBox.left = 0 as any;
+    detailBox.right = 0 as any;
+    detailBox.width = "100%" as any;
+    if (showDetailInNarrow) {
+      listBox.hide();
+      detailBox.show();
+      focusedPanel = "detail";
+      detailBox.focus();
+    } else {
+      detailBox.hide();
+      listBox.show();
+      focusedPanel = "list";
+      listBox.focus();
+    }
+  } else {
+    showDetailInNarrow = false;
+    listBox.show();
+    detailBox.show();
+    listBox.width = "40%" as any;
+    detailBox.left = "40%" as any;
+    detailBox.right = 0 as any;
+    focusedPanel = "list";
+    listBox.focus();
+  }
+  updateHeader();
+  updateFooter();
+  updateDetail();
+  screen.render();
 }
 
 function hookConsole(): void {
@@ -411,13 +502,18 @@ function closeModal(box: blessed.Widgets.BoxElement): void {
 function promptText(title: string, label: string, def = ""): Promise<string | null> {
   return new Promise((resolve) => {
     modalOpen = true;
-    const box = makeModal({ title, width: "56%", height: 8 });
+    const narrow = isNarrowLayout();
+    const box = makeModal({
+      title,
+      width: narrow ? "94%" : "56%",
+      height: narrow ? 9 : 8,
+    });
 
     blessed.text({ parent: box, top: 1, left: 2,
       content: label, tags: true, style: { bg: BG, fg: NEUTRAL } });
 
     const inp = blessed.textbox({ parent: box, top: 3, left: 2, right: 2, height: 1,
-      inputOnFocus: true, value: def,
+      inputOnFocus: true, value: def, keys: true, vi: true, mouse: true, cursors: true,
       style: { bg: "#2a2a29", fg: NEUTRAL, focus: { bg: "#383836" } } });
 
     blessed.text({ parent: box, bottom: 1, left: 2,
@@ -510,7 +606,12 @@ function confirmDialog(msg: string, yesLabel = "Confirm"): Promise<boolean> {
       mouse: true, keys: true,
       style: { bg: "#333331", fg: NEUTRAL, focus: { bg: "#444442" } } });
 
-    const done = (v: boolean) => { closeModal(box); resolve(v); };
+    const escHandler = () => done(false);
+    const done = (v: boolean) => {
+      (screen as any).unkey?.(["escape"], escHandler);
+      closeModal(box);
+      resolve(v);
+    };
     yes.on("press", () => done(true));
     no.on("press",  () => done(false));
     yes.key(["enter"], () => done(true));
@@ -520,6 +621,7 @@ function confirmDialog(msg: string, yesLabel = "Confirm"): Promise<boolean> {
       if (focused === no) done(false);
       else done(true);
     });
+    (screen as any).key?.(["escape"], escHandler);
     box.key(["escape", "C-c", "q", "n", "N"], () => done(false));
     box.key(["y", "Y"], () => done(true));
     yes.focus();
@@ -823,8 +925,9 @@ async function showMultiDeleteModal(): Promise<void> {
       resolve();
     }
 
-    list.key(["enter"], () => cleanup(true));
+    list.key(["enter", "return"], () => cleanup(true));
     list.key(["escape", "C-c", "q"], () => cleanup(false));
+    box.key(["enter", "return"], () => cleanup(true));
     box.key(["escape", "C-c"], () => cleanup(false));
     render();
     list.focus();
@@ -935,7 +1038,7 @@ async function showImportModal(): Promise<void> {
     `New: ${ne.length}  Updated: ${ue.length}  Skipped: ${se.length} — Apply?`, "Apply"
   );
   if (!ok) return;
-  await applyImport(preview);
+  await applyImport(preview, { ignoreDeletions: true });
   schedulePush(); forceRefresh();
   showInfo(`Imported ${ne.length + ue.length} entries`);
 }
@@ -961,7 +1064,7 @@ function forceSync(): void {
 
 function showHelp(): void {
   modalOpen = true;
-  const box = makeModal({ title: "Help", width: "52%", height: 26 });
+  const box = makeModal({ title: "Help", width: "52%", height: 27 });
   box.setContent([
     "",
     `  {${ACCENT}-fg}Navigation{/}`,
@@ -970,6 +1073,7 @@ function showHelp(): void {
     `  {${HINT}-fg}g{/}           Go to top`,
     `  {${HINT}-fg}G{/}           Go to bottom`,
     `  {${HINT}-fg}Tab{/}         Switch list ↔ detail`,
+    `  {${HINT}-fg}t{/}           Toggle detail (narrow)`,
     "",
     `  {${ACCENT}-fg}Actions{/}`,
     `  {${HINT}-fg}Enter{/}       Play selected`,
@@ -1035,15 +1139,32 @@ function bindKeys(): void {
   screen.key(["e"],     guard(showEditModal));
   screen.key(["f"],     guard(toggleFinished));
   screen.key(["r"],     guard(renameSelected));
-  screen.key(["d"],     guard(showDeleteModal));
-  screen.key(["D"],     guard(showMultiDeleteModal));
+  const handleDeleteKey = guard(() => {
+    if (lastKeyShift) return showMultiDeleteModal();
+    return showDeleteModal();
+  });
+  screen.on("keypress", (_ch: string | undefined, key: any) => {
+    if (!key || key.name !== "d") return;
+    lastKeyShift = !!key.shift;
+    handleDeleteKey();
+  });
   screen.key(["i"],     guard(showImportModal));
   screen.key(["x"],     guard(showExportModal));
   screen.key(["u"],     guard(showDedupeModal));
   screen.key(["s"],     guard(forceSync));
   screen.key(["?"],     guard(showHelp));
+  screen.key(["t"], guard(() => {
+    if (layoutMode !== "narrow") return;
+    showDetailInNarrow = !showDetailInNarrow;
+    applyLayout();
+  }));
 
   screen.key(["tab"], guard(() => {
+    if (layoutMode === "narrow") {
+      showDetailInNarrow = !showDetailInNarrow;
+      applyLayout();
+      return;
+    }
     if (focusedPanel === "list") {
       focusedPanel = "detail";
       (detailBox as any).style.border.fg = ACCENT;
@@ -1074,11 +1195,13 @@ function bindKeys(): void {
     screen.render();
   });
 
-  screen.key(["q"], async () => {
+  screen.key(["q"], guard(async () => {
     if (modalOpen) return;
+    const ok = await confirmDialog("Quit player?", "Quit");
+    if (!ok) return;
     await flushSync();
     process.exit(0);
-  });
+  }));
 }
 
 // ─── LAYOUT ───────────────────────────────────────────────────────────────────
@@ -1123,7 +1246,7 @@ function buildLayout(): void {
   screen.append(detailBox);
   screen.append(footerBox);
   screen.append(errorBar);
-  screen.on("resize", () => screen.render());
+  screen.on("resize", () => applyLayout());
 }
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
@@ -1169,6 +1292,7 @@ async function main(): Promise<void> {
   bindKeys();
   hookConsole();
   setTuiActive(true);
+  applyLayout();
 
   storeEmitter.on("change", () => { refreshList();   screen.render(); });
   storeEmitter.on("sync",   () => { updateHeader();  screen.render(); });

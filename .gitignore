@@ -4,3 +4,5 @@ node-modules
 node_modules
 .mpv-player-secrets
 progress-export.json
+series-exported.json
+progress-export-2.json

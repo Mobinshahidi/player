@@ -54,6 +54,8 @@ export interface SeriesProgress {
   manualUrls?: string[];
   isMovie?: boolean;
   isOnetime?: boolean;
+  overview?: string;
+  genres?: string[];
 }
 
 export type ProgressStore = Record<string, SeriesProgress>;
@@ -341,11 +343,12 @@ export async function pushToArvan(s: ProgressStore) {
 export function mergeStores(
   local: ProgressStore,
   remote: ProgressStore,
+  options?: { ignoreDeletions?: boolean },
 ): { merged: ProgressStore; remoteWon: string[] } {
   const merged = { ...local };
   const remoteWon: string[] = [];
   for (const [key, rp] of Object.entries(remote)) {
-    if (deletionLog[key]) {
+    if (!options?.ignoreDeletions && deletionLog[key]) {
       const deletedAt = new Date(deletionLog[key]).getTime();
       const remoteUpdated = rp.updatedAt ? new Date(rp.updatedAt).getTime() : 0;
       if (deletedAt >= remoteUpdated) continue;
@@ -1400,7 +1403,7 @@ export function storeToSeriesProject(s: ProgressStore): SeriesProjectEntry[] {
     // Try to extract a year from the key (e.g. "Interstellar.2014" -> 2014)
     const yearMatch = key.match(/\b(19|20)\d{2}\b/);
     const year = yearMatch ? parseInt(yearMatch[0], 10) : null;
-    return {
+    const entry: SeriesProjectEntry = {
       id: `player_${key}`,
       title,
       year,
@@ -1413,6 +1416,9 @@ export function storeToSeriesProject(s: ProgressStore): SeriesProjectEntry[] {
           ? "Watching"
           : "Plan to Watch",
     };
+    if (p.overview) entry._overview = p.overview;
+    if (p.genres && p.genres.length > 0) entry.genres = p.genres;
+    return entry;
   });
 }
 
@@ -1430,7 +1436,11 @@ export function parseImportFile(raw: unknown): ProgressStore {
           ? entry.id.slice(7)
           : (entry.title ?? entry.id ?? "unknown");
       if (!key) continue;
-      result[sanitiseKey(key)] = entry.playerData as SeriesProgress;
+      const p = { ...(entry.playerData as SeriesProgress) };
+      if (!p.overview && entry._overview) p.overview = entry._overview;
+      if ((!p.genres || p.genres.length === 0) && entry.genres)
+        p.genres = entry.genres;
+      result[sanitiseKey(key)] = p;
     }
     return result;
   }
@@ -1495,8 +1505,11 @@ export async function importFromFile(filePath: string): Promise<ImportPreview> {
 }
 
 // Apply a previously generated preview to the store.
-export async function applyImport(preview: ImportPreview): Promise<void> {
-  const { merged } = mergeStores(store, preview.imported);
+export async function applyImport(
+  preview: ImportPreview,
+  options?: { ignoreDeletions?: boolean },
+): Promise<void> {
+  const { merged } = mergeStores(store, preview.imported, options);
   store = merged;
   saveLocalStore(store);
   schedulePush(true);
