@@ -1675,6 +1675,11 @@ function buildLayout(): void {
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
+  if (IS_TERMUX) {
+    console.error("Termux detected — the full-screen TUI is not supported on Termux.");
+    console.error("Use the CLI instead: `npx tsx player.ts` — it provides the same features and a cleaner mobile experience.");
+    process.exit(1);
+  }
   process.on("uncaughtException", (err) => {
     logToFile(`uncaughtException: ${err?.stack || err}`);
   });

@@ -1204,11 +1204,23 @@ export async function playWithVlcAndroid(
   // Passing the local file path works much better once enough is buffered.
   const dl = startDownload(episodeUrl, localPath);
 
-  // Wait up to 30 s for the file to appear and grow to at least 2 MB
+  // Wait up to 60 s for the file to appear, grow to at least 2 MB, and be readable
   console.log("[cache] Waiting for initial buffer…");
-  for (let i = 0; i < 150; i++) {
+  const startWait = Date.now();
+  for (let i = 0; i < 300; i++) {
     await new Promise((r) => setTimeout(r, 200));
-    if (existsSync(localPath) && videoFileSize(localPath) >= 2_097_152) break;
+    try {
+      if (existsSync(localPath) && videoFileSize(localPath) >= 2_097_152) {
+        // test readability
+        try {
+          require("fs").accessSync(localPath, require("fs").constants.R_OK);
+          break;
+        } catch {
+          // not readable yet
+        }
+      }
+    } catch {}
+    if (Date.now() - startWait > 60_000) break;
   }
 
   // Normalize to canonical path — /sdcard is a symlink that Android's
