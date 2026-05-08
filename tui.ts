@@ -53,16 +53,24 @@ import type {
 
 // ─── COLOR PALETTE ────────────────────────────────────────────────────────────
 
-const BG          = "#1e1e1d";
-const BORDER      = "#3a3a38";
-const SELECTED_BG = "#d57455";
-const SELECTED_FG = "#1e1e1d";
-const FINISHED_FG = "#6b6b64";
-const WATCHING_FG = "#d57455";
-const NEUTRAL     = "#c3c2b7";
-const HINT        = "#6b6b64";
-const HEADER_BG   = "#161615";
-const ACCENT      = "#d57455";
+// ─── COLOR PALETTE ────────────────────────────────────────────────────────────
+// Termux's default terminal doesn't advertise COLORTERM=truecolor, so blessed
+// maps 24-bit hex values to the nearest xterm-256 color — which turns #d57455
+// into bright red. Detect truecolor support and fall back to named colors.
+const hasTruecolor =
+  process.env.COLORTERM === "truecolor" ||
+  process.env.COLORTERM === "24bit";
+
+const BG          = hasTruecolor ? "#1e1e1d" : "black";
+const BORDER      = hasTruecolor ? "#3a3a38" : "grey";
+const SELECTED_BG = hasTruecolor ? "#d57455" : "yellow";
+const SELECTED_FG = hasTruecolor ? "#1e1e1d" : "black";
+const FINISHED_FG = hasTruecolor ? "#6b6b64" : "grey";
+const WATCHING_FG = hasTruecolor ? "#d57455" : "yellow";
+const NEUTRAL     = hasTruecolor ? "#c3c2b7" : "white";
+const HINT        = hasTruecolor ? "#6b6b64" : "grey";
+const HEADER_BG   = hasTruecolor ? "#161615" : "black";
+const ACCENT      = hasTruecolor ? "#d57455" : "yellow";
 const LOG_PATH    = join(CONFIG_DIR, "player-tui.log");
 
 // ─── HELPERS ──────────────────────────────────────────────────────────────────
@@ -634,12 +642,11 @@ async function playSelected(): Promise<void> {
   if (!playInKitty) {
     setTuiActive(false);
     if (IS_TERMUX) {
-      // On Termux: drop out of the blessed alt-screen entirely so VLC gets a
-      // clean terminal surface.  blessed's leave() / screen.destroy() are too
-      // aggressive; program-level buffer switch is enough and lets us restore.
+      // screen.leave() does not exist on blessed's Screen object — it's a no-op.
+      // Use the Program-level buffer switch so the terminal is clean for VLC.
       screen.program.showCursor();
       screen.program.normalBuffer();
-      process.stdout.write("\x1b[2J\x1b[H"); // clear the now-normal screen
+      process.stdout.write("\x1b[2J\x1b[H");
     } else {
       (screen as any).leave?.();
     }
@@ -860,7 +867,6 @@ async function playSelected(): Promise<void> {
 
   if (!playInKitty) {
     if (IS_TERMUX) {
-      // Restore the blessed alt-screen after VLC closes.
       screen.program.alternateBuffer();
       screen.program.hideCursor();
     } else {

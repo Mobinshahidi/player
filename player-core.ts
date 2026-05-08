@@ -90,9 +90,6 @@ export const MPV_SOCKET = join(CONFIG_DIR, "mpv.sock");
 export const IS_TERMUX =
   process.env.PREFIX?.includes("com.termux") ||
   existsSync("/data/data/com.termux");
-// Use the canonical /storage/emulated/0 path — /sdcard is a symlink that VLC
-// and Android's MediaStore do NOT follow when resolving content:// URIs.
-// termux-open / termux-share also require the real path.
 export const TERMUX_VIDEO_DIR = IS_TERMUX
   ? process.env.PLAYER_TERMUX_VIDEO_DIR ||
     (existsSync("/storage/emulated/0")
@@ -280,7 +277,6 @@ export async function s3Request(
 
 export function ensureConfigDir() {
   const dirs = [CONFIG_DIR, CACHE_DIR, VIDEO_DIR];
-  // On Termux, also guarantee the shared-storage cache dir exists so VLC can read it.
   if (IS_TERMUX && TERMUX_VIDEO_DIR !== VIDEO_DIR) dirs.push(TERMUX_VIDEO_DIR);
   for (const d of dirs)
     if (!existsSync(d)) mkdirSync(d, { recursive: true });
@@ -1171,17 +1167,15 @@ export function playWithMpvDesktop(
 export const VLC_PACKAGE = "org.videolan.vlc";
 
 export function isVlcRunning(): boolean {
+  // dumpsys requires android.permission.DUMP which Termux never has —
+  // it always returns a permission denial, making the old logic return false
+  // immediately. pgrep is unprivileged and works reliably.
   try {
-    const focus = execSync(
-      "dumpsys activity 2>/dev/null | grep mCurrentFocus",
-      { encoding: "utf-8", timeout: 3000 },
-    );
-    if (focus.includes(VLC_PACKAGE)) return true;
-    const pg = execSync(`pgrep -f ${VLC_PACKAGE} 2>/dev/null || echo ''`, {
+    const pid = execSync(`pgrep -f "${VLC_PACKAGE}" 2>/dev/null || true`, {
       encoding: "utf-8",
-      timeout: 2000,
-    });
-    return pg.trim().length > 0;
+      timeout: 3000,
+    }).trim();
+    return pid.length > 0;
   } catch {
     return false;
   }
@@ -1217,56 +1211,73 @@ export async function playWithVlcAndroid(
     if (existsSync(localPath) && videoFileSize(localPath) >= 2_097_152) break;
   }
 
+  // Normalize to canonical path — /sdcard is a symlink that Android's
+  // FileProvider refuses to resolve, causing silent failures in VLC.
+  const canonicalPath = localPath.replace(/^\/sdcard\//, "/storage/emulated/0/");
   const posMs = Math.floor(startTime * 1000);
-  const amExtras =
+  const extras =
     posMs > 0
       ? `--el position ${posMs} --ez from_start false`
       : `--ez from_start true`;
 
   // Android 7+ blocks file:// URIs between apps (FileUriExposedException).
-  // Project lives in /data/data/com.termux/... which is inaccessible to VLC.
-  // The only reliable path: copy the file to /storage/emulated/0/player-cache
-  // (which TERMUX_VIDEO_DIR already points to) then open it via termux-open
-  // which wraps a proper content:// URI through Termux's FileProvider.
-  function launchVlcLocal(path: string): boolean {
-    // termux-open (from termux-tools) handles the FileProvider bridge.
-    // It respects the default video app set on the device (usually VLC).
+  // Strategy (most to least reliable):
+  //   1. termux-open  — Termux FileProvider bridge, works for local files
+  //   2. termux-share — opens Android chooser, user picks VLC
+  //   3. termux-am    — Termux's am wrapper, correct permissions on Android 10+
+  //   4. bare am      — last resort, may lack permissions on newer ROMs
+  //
+  // VLC modern entry point is .StartActivity (legacy .gui.video.VideoPlayerActivity
+  // still works on older builds as a fallback).
+
+  function launchLocal(path: string): boolean {
     try {
       execSync(`termux-open --content-type "video/*" "${path}"`, {
-        stdio: "ignore", timeout: 5000,
+        stdio: "ignore", timeout: 6000,
       });
       return true;
     } catch {}
-    // termux-share opens an Android chooser — user picks VLC there.
     try {
       execSync(`termux-share -a view "${path}"`, {
-        stdio: "ignore", timeout: 5000,
+        stdio: "ignore", timeout: 6000,
       });
       return true;
     } catch {}
     return false;
   }
 
-  function launchVlcRemote(url: string): boolean {
-    // Remote URLs don't hit the FileProvider restriction.
-    const cmd = `am start -a android.intent.action.VIEW -n "${VLC_PACKAGE}/.gui.video.VideoPlayerActivity" -d "${url}" -t "video/*" ${amExtras}`;
+  function launchRemote(url: string): boolean {
+    const viewIntent = `-a android.intent.action.VIEW -d "${url}" -t "video/*" ${extras}`;
+    // Try termux-am first (has correct permissions on Android 10+)
     try {
-      execSync(cmd, { stdio: "ignore", timeout: 5000 });
+      execSync(`termux-am start ${viewIntent}`, { stdio: "ignore", timeout: 6000 });
       return true;
     } catch {}
+    // Modern VLC activity name
     try {
       execSync(
-        `am start -a android.intent.action.VIEW -d "${url}" -t "video/*" ${amExtras}`,
-        { stdio: "ignore", timeout: 5000 },
+        `am start -n "${VLC_PACKAGE}/.StartActivity" ${viewIntent}`,
+        { stdio: "ignore", timeout: 6000 },
       );
       return true;
     } catch {}
+    // Legacy VLC activity name
+    try {
+      execSync(
+        `am start -n "${VLC_PACKAGE}/.gui.video.VideoPlayerActivity" ${viewIntent}`,
+        { stdio: "ignore", timeout: 6000 },
+      );
+      return true;
+    } catch {}
+    // Implicit intent — no component name
+    try {
+      execSync(`am start ${viewIntent}`, { stdio: "ignore", timeout: 6000 });
+      return true;
+    } catch {}
     return false;
   }
 
-  // Always try the cached local file first (enables resume + seek).
-  // Fall back to streaming the remote URL if the file isn't accessible.
-  const launched = launchVlcLocal(localPath) || launchVlcRemote(episodeUrl);
+  const launched = launchLocal(canonicalPath) || launchRemote(episodeUrl);
   if (launched) {
     console.log("[VLC launched — return here when done watching]");
   } else {
@@ -1274,8 +1285,9 @@ export async function playWithVlcAndroid(
     console.log(`  Local file: ${localPath}`);
   }
 
-  // Poll until VLC closes (check every 3 s, give up after 8 h)
-  await new Promise((r) => setTimeout(r, 3000));
+  // Give VLC time to start before we begin polling.
+  // The old 3 s wait was too short on slower devices.
+  await new Promise((r) => setTimeout(r, 5000));
   for (let i = 0; i < 9600; i++) {
     await new Promise((r) => setTimeout(r, 3000));
     if (!isVlcRunning()) break;
