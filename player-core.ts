@@ -1202,26 +1202,29 @@ export async function playWithVlcAndroid(
   // Start download first — wait until we have enough data before opening VLC.
   // On Termux, passing the remote URL to VLC works but gives no seek/resume control.
   // Passing the local file path works much better once enough is buffered.
-  const dl = startDownload(episodeUrl, localPath);
+  let downloadDone = false;
+const dl = startDownload(episodeUrl, localPath, 0, () => {
+  downloadDone = true;
+});
 
-  // Wait up to 60 s for the file to appear, grow to at least 2 MB, and be readable
-  console.log("[cache] Waiting for initial buffer…");
-  const startWait = Date.now();
-  for (let i = 0; i < 300; i++) {
-    await new Promise((r) => setTimeout(r, 200));
-    try {
-      if (existsSync(localPath) && videoFileSize(localPath) >= 2_097_152) {
-        // test readability
-        try {
-          require("fs").accessSync(localPath, require("fs").constants.R_OK);
-          break;
-        } catch {
-          // not readable yet
-        }
-      }
-    } catch {}
-    if (Date.now() - startWait > 60_000) break;
-  }
+// On Termux, lower the threshold to 512 KB — connections are fast enough
+// that 2 MB may never be seen mid-download before it completes.
+const TERMUX_MIN_BUFFER = 524_288; // 512 KB
+console.log("[cache] Waiting for initial buffer…");
+const startWait = Date.now();
+for (let i = 0; i < 300; i++) {
+  await new Promise((r) => setTimeout(r, 200));
+  if (downloadDone) break; // full file ready, no need to wait
+  try {
+    if (existsSync(localPath) && videoFileSize(localPath) >= TERMUX_MIN_BUFFER) {
+      try {
+        require("fs").accessSync(localPath, require("fs").constants.R_OK);
+        break;
+      } catch {}
+    }
+  } catch {}
+  if (Date.now() - startWait > 60_000) break;
+}
 
   // Normalize to canonical path — /sdcard is a symlink that Android's
   // FileProvider refuses to resolve, causing silent failures in VLC.
