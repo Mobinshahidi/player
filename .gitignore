@@ -7,3 +7,6 @@ progress-export.json
 series-exported.json
 progress-export-2.json
 .mpv-web-player/
+*.js.map
+.env
+.env.*

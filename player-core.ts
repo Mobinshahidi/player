@@ -1245,8 +1245,8 @@ export async function playWithVlcAndroid(
   function launchLocal(path: string): boolean {
   // 1. termux-open with content type (Termux FileProvider bridge)
   try {
-    execSync(`termux-open --content-type "video/*" "${path}"`, {
-      stdio: "ignore", timeout: 6000,
+    execSync(`termux-open "${path}"`, {
+        stdio: "ignore", timeout: 6000,
     });
     return true;
   } catch {}
