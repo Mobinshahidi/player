@@ -1243,20 +1243,42 @@ export async function playWithVlcAndroid(
   // still works on older builds as a fallback).
 
   function launchLocal(path: string): boolean {
-    try {
-      execSync(`termux-open --content-type "video/*" "${path}"`, {
-        stdio: "ignore", timeout: 6000,
-      });
-      return true;
-    } catch {}
-    try {
-      execSync(`termux-share -a view "${path}"`, {
-        stdio: "ignore", timeout: 6000,
-      });
-      return true;
-    } catch {}
-    return false;
-  }
+  // 1. termux-open with content type (Termux FileProvider bridge)
+  try {
+    execSync(`termux-open --content-type "video/*" "${path}"`, {
+      stdio: "ignore", timeout: 6000,
+    });
+    return true;
+  } catch {}
+
+  // 2. termux-am with a VIEW intent on the file:// URI (works on GrapheneOS)
+  try {
+    execSync(
+      `termux-am start -a android.intent.action.VIEW -d "file://${path}" -t "video/*" -n "${VLC_PACKAGE}/.StartActivity" --grant-read-uri-permission`,
+      { stdio: "ignore", timeout: 6000 },
+    );
+    return true;
+  } catch {}
+
+  // 3. termux-am without component (implicit, lets Android resolve to VLC)
+  try {
+    execSync(
+      `termux-am start -a android.intent.action.VIEW -d "file://${path}" -t "video/*" --grant-read-uri-permission`,
+      { stdio: "ignore", timeout: 6000 },
+    );
+    return true;
+  } catch {}
+
+  // 4. termux-share as last local fallback
+  try {
+    execSync(`termux-share -a view "${path}"`, {
+      stdio: "ignore", timeout: 6000,
+    });
+    return true;
+  } catch {}
+
+  return false;
+}
 
   function launchRemote(url: string): boolean {
     const viewIntent = `-a android.intent.action.VIEW -d "${url}" -t "video/*" ${extras}`;
