@@ -1212,16 +1212,11 @@ const dl = startDownload(episodeUrl, localPath, 0, () => {
 const TERMUX_MIN_BUFFER = 524_288; // 512 KB
 console.log("[cache] Waiting for initial buffer…");
 const startWait = Date.now();
-for (let i = 0; i < 300; i++) {
-  await new Promise((r) => setTimeout(r, 200));
-  if (downloadDone) break; // full file ready, no need to wait
+for (let i = 0; i < 600; i++) {
+  await new Promise((r) => setTimeout(r, 100));
+  if (downloadDone) break;
   try {
-    if (existsSync(localPath) && videoFileSize(localPath) >= TERMUX_MIN_BUFFER) {
-      try {
-        require("fs").accessSync(localPath, require("fs").constants.R_OK);
-        break;
-      } catch {}
-    }
+    if (existsSync(localPath) && videoFileSize(localPath) >= 131_072) break; // 128 KB
   } catch {}
   if (Date.now() - startWait > 60_000) break;
 }
@@ -1320,19 +1315,19 @@ for (let i = 0; i < 300; i++) {
   } else {
     console.error("[Could not launch VLC — open manually]");
     console.log(`  Local file: ${localPath}`);
+  }await new Promise((r) => setTimeout(r, 8000));
+let missCount = 0;
+for (let i = 0; i < 9600; i++) {
+  await new Promise((r) => setTimeout(r, 2000));
+  if (!isVlcRunning()) {
+    missCount++;
+    if (missCount >= 3) break;
+  } else {
+    missCount = 0;
   }
-
-  // Give VLC time to start before we begin polling.
-  // The old 3 s wait was too short on slower devices.
-  await new Promise((r) => setTimeout(r, 5000));
-  for (let i = 0; i < 9600; i++) {
-    await new Promise((r) => setTimeout(r, 3000));
-    if (!isVlcRunning()) break;
-  }
-  try {
-    dl.kill();
-  } catch {}
-  console.log("\n[Video player closed]\n");
+}
+try { dl.kill(); } catch {}
+console.log("\n[Video player closed]\n");
 
   const done = prompts
     ? await prompts.yn("Did you finish the episode? [Y/n]: ")
