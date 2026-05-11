@@ -1264,48 +1264,65 @@ export async function playWithVlcAndroid(
   // - 3 consecutive misses = VLC really closed (debounce false positives)
   // - If VLC exits early and download still running = seeked past cache, relaunch
   // - SIGINT breaks out cleanly
+
   let vlcDone = false;
-  let relaunchCount = 0;
-  const MAX_RELAUNCHES = 5;
+let relaunchCount = 0;
+const MAX_RELAUNCHES = 8;
+const vlcOpenedAt = Date.now();
+const MIN_WATCH_MS = 30_000; // relaunch if VLC closes in under 30s
 
-  const sigintHandler = () => {
-    vlcDone = true;
-    try { dl.kill(); } catch {}
-    console.log("\n[interrupted — saving progress]");
-  };
-  process.once("SIGINT", sigintHandler);
+const sigintHandler = () => {
+  vlcDone = true;
+  try { dl.kill(); } catch {}
+  console.log("\n[interrupted — saving progress]");
+};
+process.once("SIGINT", sigintHandler);
 
-  while (!vlcDone) {
-    await new Promise((r) => setTimeout(r, 8000));
-    let missCount = 0;
-    for (let i = 0; i < 9600 && !vlcDone; i++) {
-      await new Promise((r) => setTimeout(r, 2000));
-      if (!isVlcRunning()) {
-        missCount++;
-        if (missCount >= 3) break;
-      } else {
-        missCount = 0;
-      }
-    }
-    if (vlcDone) break;
+while (!vlcDone) {
+  // Give VLC time to start before polling
+  await new Promise((r) => setTimeout(r, 8000));
 
-    // VLC closed — was it because download finished normally, or seeked past cache?
-    if (!downloadDone && relaunchCount < MAX_RELAUNCHES) {
-      const sizeMB = videoFileSize(localPath) / 1_048_576;
-      console.log(`\n[cache] ${sizeMB.toFixed(1)} MB cached — waiting for more data…`);
-      relaunchCount++;
-      // Wait up to 10s for more data then relaunch
-      for (let i = 0; i < 50 && !downloadDone; i++) {
-        await new Promise((r) => setTimeout(r, 200));
-        if (videoFileSize(localPath) > sizeMB * 1_048_576 + 2_097_152) break;
-      }
-      console.log("[cache] Relaunching VLC…");
-      launchLocal(canonicalPath) || launchRemote(episodeUrl);
+  let missCount = 0;
+  for (let i = 0; i < 9600 && !vlcDone; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    if (!isVlcRunning()) {
+      missCount++;
+      if (missCount >= 3) break;
     } else {
-      vlcDone = true;
+      missCount = 0;
     }
   }
+  if (vlcDone) break;
 
+  const watchedMs = Date.now() - vlcOpenedAt;
+  const fileSizeNow = videoFileSize(localPath);
+
+  // Relaunch if: watched less than 30s (likely a seek-past-cache close)
+  // OR download not done yet
+  // AND we haven't hit max relaunches
+  if (relaunchCount < MAX_RELAUNCHES && (!downloadDone || watchedMs < MIN_WATCH_MS)) {
+    const sizeMB = fileSizeNow / 1_048_576;
+    console.log(`\n[cache] VLC closed early (${(watchedMs/1000).toFixed(0)}s, ${sizeMB.toFixed(1)} MB on disk) — waiting for buffer…`);
+    relaunchCount++;
+
+    // Wait up to 15s for more data before relaunching
+    const sizeAtClose = fileSizeNow;
+    for (let i = 0; i < 75 && !vlcDone; i++) {
+      await new Promise((r) => setTimeout(r, 200));
+      if (videoFileSize(localPath) >= sizeAtClose + 5_242_880) break; // 5 MB more
+      if (downloadDone) break;
+    }
+
+    console.log("[cache] Relaunching VLC…");
+    launchLocal(canonicalPath) || launchRemote(episodeUrl);
+  } else {
+    vlcDone = true;
+  }
+}
+
+process.off("SIGINT", sigintHandler);
+try { dl.kill(); } catch {}
+console.log("\n[Video player closed]\n");
   process.off("SIGINT", sigintHandler);
   try { dl.kill(); } catch {}
   console.log("\n[Video player closed]\n");
