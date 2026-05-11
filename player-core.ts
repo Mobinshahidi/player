@@ -1264,12 +1264,10 @@ export async function playWithVlcAndroid(
   // - 3 consecutive misses = VLC really closed (debounce false positives)
   // - If VLC exits early and download still running = seeked past cache, relaunch
   // - SIGINT breaks out cleanly
-
-  let vlcDone = false;
+let vlcDone = false;
 let relaunchCount = 0;
 const MAX_RELAUNCHES = 8;
 const vlcOpenedAt = Date.now();
-const MIN_WATCH_MS = 30_000; // relaunch if VLC closes in under 30s
 
 const sigintHandler = () => {
   vlcDone = true;
@@ -1278,8 +1276,10 @@ const sigintHandler = () => {
 };
 process.once("SIGINT", sigintHandler);
 
+// Track whether we're in local-file mode or remote-stream mode
+let usingRemote = false;
+
 while (!vlcDone) {
-  // Give VLC time to start before polling
   await new Promise((r) => setTimeout(r, 8000));
 
   let missCount = 0;
@@ -1297,24 +1297,24 @@ while (!vlcDone) {
   const watchedMs = Date.now() - vlcOpenedAt;
   const fileSizeNow = videoFileSize(localPath);
 
-  // Relaunch if: watched less than 30s (likely a seek-past-cache close)
-  // OR download not done yet
-  // AND we haven't hit max relaunches
-  if (relaunchCount < MAX_RELAUNCHES && (!downloadDone || watchedMs < MIN_WATCH_MS)) {
-    const sizeMB = fileSizeNow / 1_048_576;
-    console.log(`\n[cache] VLC closed early (${(watchedMs/1000).toFixed(0)}s, ${sizeMB.toFixed(1)} MB on disk) — waiting for buffer…`);
+  if (relaunchCount < MAX_RELAUNCHES && watchedMs < 60_000) {
     relaunchCount++;
 
-    // Wait up to 15s for more data before relaunching
-    const sizeAtClose = fileSizeNow;
-    for (let i = 0; i < 75 && !vlcDone; i++) {
-      await new Promise((r) => setTimeout(r, 200));
-      if (videoFileSize(localPath) >= sizeAtClose + 5_242_880) break; // 5 MB more
-      if (downloadDone) break;
+    if (!downloadDone && !usingRemote) {
+      // Seeked past cached data — switch to remote URL so VLC can stream freely
+      usingRemote = true;
+      console.log(`\n[cache] Seeked past cached data — switching to remote stream…`);
+      launchRemote(episodeUrl);
+      console.log("[VLC relaunched with remote URL]");
+    } else if (usingRemote) {
+      // Already on remote, just relaunch
+      console.log(`\n[cache] Relaunching remote stream…`);
+      launchRemote(episodeUrl);
+    } else {
+      // Download done but closed quickly — relaunch local
+      console.log(`\n[cache] Relaunching VLC…`);
+      launchLocal(canonicalPath) || launchRemote(episodeUrl);
     }
-
-    console.log("[cache] Relaunching VLC…");
-    launchLocal(canonicalPath) || launchRemote(episodeUrl);
   } else {
     vlcDone = true;
   }
@@ -1323,9 +1323,6 @@ while (!vlcDone) {
 process.off("SIGINT", sigintHandler);
 try { dl.kill(); } catch {}
 console.log("\n[Video player closed]\n");
-  process.off("SIGINT", sigintHandler);
-  try { dl.kill(); } catch {}
-  console.log("\n[Video player closed]\n");
 
   const done = prompts
     ? await prompts.yn("Did you finish the episode? [Y/n]: ")
