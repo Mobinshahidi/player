@@ -1227,36 +1227,25 @@ export async function playWithVlcAndroid(
     }
   }
 
-  // Wait for VLC to close.
-  // - 3 s initial grace so pgrep doesn't catch VLC before it starts.
-  // - Poll every 3 s; 3 consecutive misses = VLC really closed.
-  // - SIGINT exits cleanly within 200 ms.
-  let cancelled = false;
-  const sigintHandler = () => {
-    cancelled = true;
-    try { dl.kill(); } catch {}
-    console.log("\n[interrupted — saving progress]");
-  };
-  process.once("SIGINT", sigintHandler);
+  // On Android, VLC's process stays alive in the background cache even after
+  // the user closes the app — pgrep never returns empty, so polling is useless.
+  // The only reliable signal is the user switching back to Termux.
+  // Solution: just ask them to press Enter. Kill the download first so the
+  // terminal is quiet, then prompt.
+  try { dl.kill(); } catch {}
 
-  // 6 s startup grace, interruptible every 200 ms
-  for (let i = 0; i < 30 && !cancelled; i++)
-    await new Promise((r) => setTimeout(r, 200));
+  // Drain any final curl stderr that may still be buffered, then prompt.
+  // A short pause lets the kill propagate so the terminal is clean.
+  await new Promise((r) => setTimeout(r, 400));
 
-  // Poll until VLC closes
-  let missCount = 0;
-  for (let i = 0; i < 9600 && !cancelled; i++) {
-    await new Promise((r) => setTimeout(r, 3000));
-    if (cancelled) break;
-    if (!isVlcRunning()) {
-      if (++missCount >= 3) break;
-    } else {
-      missCount = 0;
-    }
+  if (prompts) {
+    // prompts.ask with empty string = "press Enter to continue"
+    await prompts.ask("Press Enter when you have closed VLC…");
+  } else {
+    // Non-interactive fallback (shouldn't happen in normal use)
+    await new Promise((r) => setTimeout(r, 2000));
   }
 
-  process.off("SIGINT", sigintHandler);
-  try { dl.kill(); } catch {}
   console.log("\n[Video player closed]\n");
 
   const done = prompts
