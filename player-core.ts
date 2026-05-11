@@ -1261,68 +1261,73 @@ export async function playWithVlcAndroid(
   }
 
   // Wait for VLC to close.
-  // - 3 consecutive misses = VLC really closed (debounce false positives)
-  // - If VLC exits early and download still running = seeked past cache, relaunch
-  // - SIGINT breaks out cleanly
-let vlcDone = false;
-let relaunchCount = 0;
-const MAX_RELAUNCHES = 8;
-const vlcOpenedAt = Date.now();
+  // - Startup grace: 8 s in 200 ms ticks so SIGINT is detected immediately
+  // - 3 consecutive pgrep misses = VLC really closed (debounce false positives)
+  // - Early close (< 120 s) + download not done  → seeked past cache, stream remote
+  // - Early close (< 30 s)  + download done       → spurious exit, relaunch local
+  // - SIGINT sets vlcDone and breaks out of every sleep loop
+  let vlcDone = false;
+  let relaunchCount = 0;
+  const MAX_RELAUNCHES = 8;
+  const vlcOpenedAt = Date.now();
 
-const sigintHandler = () => {
-  vlcDone = true;
-  try { dl.kill(); } catch {}
-  console.log("\n[interrupted — saving progress]");
-};
-process.once("SIGINT", sigintHandler);
+  const sigintHandler = () => {
+    vlcDone = true;
+    try { dl.kill(); } catch {}
+    console.log("\n[interrupted — saving progress]");
+  };
+  process.once("SIGINT", sigintHandler);
 
-// Track whether we're in local-file mode or remote-stream mode
-let usingRemote = false;
+  // Track whether we're in local-file mode or remote-stream mode
+  let usingRemote = false;
 
-while (!vlcDone) {
-  await new Promise((r) => setTimeout(r, 8000));
+  while (!vlcDone) {
+    // 8 s startup grace — check vlcDone every 200 ms so Ctrl+C exits promptly
+    for (let i = 0; i < 40 && !vlcDone; i++)
+      await new Promise((r) => setTimeout(r, 200));
+    if (vlcDone) break;
 
-  let missCount = 0;
-  for (let i = 0; i < 9600 && !vlcDone; i++) {
-    await new Promise((r) => setTimeout(r, 2000));
-    if (!isVlcRunning()) {
-      missCount++;
-      if (missCount >= 3) break;
-    } else {
-      missCount = 0;
+    // Poll until VLC closes; require 3 consecutive misses to avoid false positives
+    let missCount = 0;
+    for (let i = 0; i < 9600 && !vlcDone; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      if (!vlcDone) {
+        if (!isVlcRunning()) {
+          if (++missCount >= 3) break;
+        } else {
+          missCount = 0;
+        }
+      }
     }
-  }
-  if (vlcDone) break;
+    if (vlcDone) break;
 
-  const watchedMs = Date.now() - vlcOpenedAt;
-  const fileSizeNow = videoFileSize(localPath);
+    const watchedMs = Date.now() - vlcOpenedAt;
 
-  if (relaunchCount < MAX_RELAUNCHES && watchedMs < 60_000) {
-    relaunchCount++;
-
-    if (!downloadDone && !usingRemote) {
-      // Seeked past cached data — switch to remote URL so VLC can stream freely
+    if (!downloadDone && !usingRemote && relaunchCount < MAX_RELAUNCHES && watchedMs < 120_000) {
+      // Seeked past cached data — switch to remote URL so VLC streams freely
+      relaunchCount++;
       usingRemote = true;
-      console.log(`\n[cache] Seeked past cached data — switching to remote stream…`);
+      console.log(`\n[cache] Seeked past buffer — streaming remote URL…`);
       launchRemote(episodeUrl);
       console.log("[VLC relaunched with remote URL]");
-    } else if (usingRemote) {
-      // Already on remote, just relaunch
+    } else if (usingRemote && relaunchCount < MAX_RELAUNCHES && watchedMs < 120_000) {
+      // Already on remote stream, relaunch it
+      relaunchCount++;
       console.log(`\n[cache] Relaunching remote stream…`);
       launchRemote(episodeUrl);
-    } else {
-      // Download done but closed quickly — relaunch local
+    } else if (downloadDone && relaunchCount < MAX_RELAUNCHES && watchedMs < 30_000) {
+      // Download finished but VLC closed suspiciously fast — relaunch local
+      relaunchCount++;
       console.log(`\n[cache] Relaunching VLC…`);
       launchLocal(canonicalPath) || launchRemote(episodeUrl);
+    } else {
+      vlcDone = true;
     }
-  } else {
-    vlcDone = true;
   }
-}
 
-process.off("SIGINT", sigintHandler);
-try { dl.kill(); } catch {}
-console.log("\n[Video player closed]\n");
+  process.off("SIGINT", sigintHandler);
+  try { dl.kill(); } catch {}
+  console.log("\n[Video player closed]\n");
 
   const done = prompts
     ? await prompts.yn("Did you finish the episode? [Y/n]: ")
