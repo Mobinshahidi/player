@@ -1171,7 +1171,7 @@ export function isVlcRunning(): boolean {
   // it always returns a permission denial, making the old logic return false
   // immediately. pgrep is unprivileged and works reliably.
   try {
-    const pid = execSync(`pgrep -f "${VLC_PACKAGE}" 2>/dev/null || true`, {
+    const pid = execSync(`pgrep -f ${VLC_PACKAGE} 2>/dev/null || true`, {
       encoding: "utf-8",
       timeout: 3000,
     }).trim();
@@ -1239,8 +1239,8 @@ export async function playWithVlcAndroid(
   };
   process.once("SIGINT", sigintHandler);
 
-  // 3 s startup grace, interruptible every 200 ms
-  for (let i = 0; i < 15 && !cancelled; i++)
+  // 6 s startup grace, interruptible every 200 ms
+  for (let i = 0; i < 30 && !cancelled; i++)
     await new Promise((r) => setTimeout(r, 200));
 
   // Poll until VLC closes
