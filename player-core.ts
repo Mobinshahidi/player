@@ -1196,150 +1196,63 @@ export async function playWithVlcAndroid(
   prompts?: VlcPrompts,
 ): Promise<PlayResult> {
   const localPath = videoCachePath(episodeUrl, seriesLabel);
-  console.log(`\nDownloading: ${cleanFilename(localPath)}`);
-  if (startTime > 0) console.log(`Will resume from: ${formatTime(startTime)}`);
+  console.log(`\nOpening in VLC: ${cleanFilename(localPath)}`);
+  if (startTime > 0) console.log(`Resume from: ${formatTime(startTime)}`);
 
-  let downloadDone = false;
-  const dl = startDownload(episodeUrl, localPath, 0, () => {
-    downloadDone = true;
-  });
+  // Download in background — VLC streams the remote URL directly so seeking
+  // always works. The local file is just a cache for next time.
+  const dl = startDownload(episodeUrl, localPath, 0);
 
-  // Wait for 128 KB before opening VLC — enough for a valid container header.
-  console.log("[cache] Waiting for initial buffer…");
-  const startWait = Date.now();
-  for (let i = 0; i < 600; i++) {
-    await new Promise((r) => setTimeout(r, 100));
-    if (downloadDone) break;
-    try {
-      if (existsSync(localPath) && videoFileSize(localPath) >= 131_072) break;
-    } catch {}
-    if (Date.now() - startWait > 60_000) break;
-  }
-
-  const canonicalPath = localPath.replace(/^\/sdcard\//, "/storage/emulated/0/");
+  // Launch VLC with the remote HTTP URL so it can seek freely.
+  // termux-am is preferred (Termux:API); fall back to bare am.
   const posMs = Math.floor(startTime * 1000);
-  const extras =
-    posMs > 0
-      ? `--el position ${posMs} --ez from_start false`
-      : `--ez from_start true`;
-
-  function launchLocal(path: string): boolean {
-    try {
-      execSync(`termux-open "${path}"`, { stdio: "ignore", timeout: 6000 });
-      return true;
-    } catch {}
-    try {
-      execSync(`termux-share -a view "${path}"`, { stdio: "ignore", timeout: 6000 });
-      return true;
-    } catch {}
-    return false;
-  }
-
-  function launchRemote(url: string): boolean {
-    const viewIntent = `-a android.intent.action.VIEW -d "${url}" -t "video/*" ${extras}`;
-    try {
-      execSync(`termux-am start ${viewIntent}`, { stdio: "ignore", timeout: 6000 });
-      return true;
-    } catch {}
-    try {
-      execSync(`am start -n "${VLC_PACKAGE}/.StartActivity" ${viewIntent}`, { stdio: "ignore", timeout: 6000 });
-      return true;
-    } catch {}
-    try {
-      execSync(`am start ${viewIntent}`, { stdio: "ignore", timeout: 6000 });
-      return true;
-    } catch {}
-    return false;
-  }
-
-  const launched = launchLocal(canonicalPath) || launchRemote(episodeUrl);
-  if (launched) {
+  const extras = posMs > 0
+    ? `--el position ${posMs} --ez from_start false`
+    : `--ez from_start true`;
+  const viewIntent = `-a android.intent.action.VIEW -d "${episodeUrl}" -t "video/*" ${extras}`;
+  try {
+    execSync(`termux-am start ${viewIntent}`, { stdio: "ignore", timeout: 6000 });
     console.log("[VLC launched — return here when done watching]");
-  } else {
-    console.error("[Could not launch VLC — open manually]");
-    console.log(`  Local file: ${localPath}`);
-  }
-
-  // waitForThisVlcToClose: waits for the VLC instance just launched to exit.
-  // Returns the number of ms VLC was open (measured from launchTime).
-  // Returns -1 if vlcDone was set by SIGINT before VLC closed.
-  //
-  // Design:
-  //   1. 8 s startup grace in 200 ms ticks — so Ctrl+C exits within 200 ms.
-  //   2. Poll every 2 s; require 3 consecutive pgrep misses before declaring closed
-  //      (pgrep sometimes returns empty for 1-2 polls while VLC is still running).
-  async function waitForThisVlcToClose(launchTime: number): Promise<number> {
-    // Startup grace: 8 s, interruptible every 200 ms
-    for (let i = 0; i < 40 && !vlcDone; i++)
-      await new Promise((r) => setTimeout(r, 200));
-    if (vlcDone) return -1;
-
-    // Poll until 3 consecutive misses or SIGINT
-    let missCount = 0;
-    for (let i = 0; i < 9600 && !vlcDone; i++) {
-      await new Promise((r) => setTimeout(r, 2000));
-      if (vlcDone) return -1;
-      if (!isVlcRunning()) {
-        if (++missCount >= 3) break;
-      } else {
-        missCount = 0;
+  } catch {
+    try {
+      execSync(`am start -n "${VLC_PACKAGE}/.gui.video.VideoPlayerActivity" ${viewIntent}`, { stdio: "ignore", timeout: 5000 });
+      console.log("[VLC launched — return here when done watching]");
+    } catch {
+      try {
+        execSync(`am start ${viewIntent}`, { stdio: "ignore", timeout: 5000 });
+        console.log("[Video player launched — return here when done watching]");
+      } catch (e) {
+        console.error("[Could not launch video player]", (e as Error).message);
       }
     }
-    if (vlcDone) return -1;
-    return Date.now() - launchTime;
   }
 
-  let vlcDone = false;
-  let relaunchCount = 0;
-  const MAX_RELAUNCHES = 8;
-  let usingRemote = false;
-
+  // Wait for VLC to close.
+  // - 3 s initial grace so pgrep doesn't catch VLC before it starts.
+  // - Poll every 3 s; 3 consecutive misses = VLC really closed.
+  // - SIGINT exits cleanly within 200 ms.
+  let cancelled = false;
   const sigintHandler = () => {
-    vlcDone = true;
+    cancelled = true;
     try { dl.kill(); } catch {}
     console.log("\n[interrupted — saving progress]");
   };
   process.once("SIGINT", sigintHandler);
 
-  // Main loop: each iteration waits for one VLC instance, then decides what to do.
-  vlcLoop: while (true) {
-    const launchTime = Date.now();
-    const openMs = await waitForThisVlcToClose(launchTime);
+  // 3 s startup grace, interruptible every 200 ms
+  for (let i = 0; i < 15 && !cancelled; i++)
+    await new Promise((r) => setTimeout(r, 200));
 
-    // SIGINT fired — stop immediately, go to prompts
-    if (openMs === -1) break;
-
-    // VLC was open long enough — user finished watching, go to prompts
-    const EARLY_CLOSE_LOCAL_MS  = 30_000;   // < 30 s after download done = spurious crash
-    const EARLY_CLOSE_REMOTE_MS = 120_000;  // < 120 s while streaming = seeked forward
-
-    const isEarlyClose = usingRemote
-      ? openMs < EARLY_CLOSE_REMOTE_MS
-      : (!downloadDone && openMs < EARLY_CLOSE_REMOTE_MS) || (downloadDone && openMs < EARLY_CLOSE_LOCAL_MS);
-
-    if (!isEarlyClose || relaunchCount >= MAX_RELAUNCHES) {
-      // Normal exit — user watched long enough or we've exhausted relaunches
-      break vlcLoop;
-    }
-
-    // Early close: decide what to relaunch
-    relaunchCount++;
-
-    if (!downloadDone && !usingRemote) {
-      // Seeked past cached data → switch to remote HTTP stream
-      usingRemote = true;
-      console.log(`\n[cache] Seeked past buffer — streaming remote URL… (relaunch ${relaunchCount}/${MAX_RELAUNCHES})`);
-      launchRemote(episodeUrl);
-    } else if (usingRemote) {
-      // Remote stream closed early again (network hiccup?) → relaunch remote
-      console.log(`\n[cache] Remote stream closed early — relaunching… (relaunch ${relaunchCount}/${MAX_RELAUNCHES})`);
-      launchRemote(episodeUrl);
+  // Poll until VLC closes
+  let missCount = 0;
+  for (let i = 0; i < 9600 && !cancelled; i++) {
+    await new Promise((r) => setTimeout(r, 3000));
+    if (cancelled) break;
+    if (!isVlcRunning()) {
+      if (++missCount >= 3) break;
     } else {
-      // Download done but VLC crashed immediately → relaunch local
-      console.log(`\n[cache] VLC closed unexpectedly — relaunching… (relaunch ${relaunchCount}/${MAX_RELAUNCHES})`);
-      launchLocal(canonicalPath) || launchRemote(episodeUrl);
+      missCount = 0;
     }
-    // Continue the loop to wait for the newly launched instance
   }
 
   process.off("SIGINT", sigintHandler);
