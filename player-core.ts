@@ -1260,16 +1260,39 @@ export async function playWithVlcAndroid(
     console.log(`  Local file: ${localPath}`);
   }
 
-  // Wait for VLC to close.
-  // - Startup grace: 8 s in 200 ms ticks so SIGINT is detected immediately
-  // - 3 consecutive pgrep misses = VLC really closed (debounce false positives)
-  // - Early close (< 120 s) + download not done  → seeked past cache, stream remote
-  // - Early close (< 30 s)  + download done       → spurious exit, relaunch local
-  // - SIGINT sets vlcDone and breaks out of every sleep loop
+  // waitForThisVlcToClose: waits for the VLC instance just launched to exit.
+  // Returns the number of ms VLC was open (measured from launchTime).
+  // Returns -1 if vlcDone was set by SIGINT before VLC closed.
+  //
+  // Design:
+  //   1. 8 s startup grace in 200 ms ticks — so Ctrl+C exits within 200 ms.
+  //   2. Poll every 2 s; require 3 consecutive pgrep misses before declaring closed
+  //      (pgrep sometimes returns empty for 1-2 polls while VLC is still running).
+  async function waitForThisVlcToClose(launchTime: number): Promise<number> {
+    // Startup grace: 8 s, interruptible every 200 ms
+    for (let i = 0; i < 40 && !vlcDone; i++)
+      await new Promise((r) => setTimeout(r, 200));
+    if (vlcDone) return -1;
+
+    // Poll until 3 consecutive misses or SIGINT
+    let missCount = 0;
+    for (let i = 0; i < 9600 && !vlcDone; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      if (vlcDone) return -1;
+      if (!isVlcRunning()) {
+        if (++missCount >= 3) break;
+      } else {
+        missCount = 0;
+      }
+    }
+    if (vlcDone) return -1;
+    return Date.now() - launchTime;
+  }
+
   let vlcDone = false;
   let relaunchCount = 0;
   const MAX_RELAUNCHES = 8;
-  const vlcOpenedAt = Date.now();
+  let usingRemote = false;
 
   const sigintHandler = () => {
     vlcDone = true;
@@ -1278,51 +1301,45 @@ export async function playWithVlcAndroid(
   };
   process.once("SIGINT", sigintHandler);
 
-  // Track whether we're in local-file mode or remote-stream mode
-  let usingRemote = false;
+  // Main loop: each iteration waits for one VLC instance, then decides what to do.
+  vlcLoop: while (true) {
+    const launchTime = Date.now();
+    const openMs = await waitForThisVlcToClose(launchTime);
 
-  while (!vlcDone) {
-    // 8 s startup grace — check vlcDone every 200 ms so Ctrl+C exits promptly
-    for (let i = 0; i < 40 && !vlcDone; i++)
-      await new Promise((r) => setTimeout(r, 200));
-    if (vlcDone) break;
+    // SIGINT fired — stop immediately, go to prompts
+    if (openMs === -1) break;
 
-    // Poll until VLC closes; require 3 consecutive misses to avoid false positives
-    let missCount = 0;
-    for (let i = 0; i < 9600 && !vlcDone; i++) {
-      await new Promise((r) => setTimeout(r, 2000));
-      if (!vlcDone) {
-        if (!isVlcRunning()) {
-          if (++missCount >= 3) break;
-        } else {
-          missCount = 0;
-        }
-      }
+    // VLC was open long enough — user finished watching, go to prompts
+    const EARLY_CLOSE_LOCAL_MS  = 30_000;   // < 30 s after download done = spurious crash
+    const EARLY_CLOSE_REMOTE_MS = 120_000;  // < 120 s while streaming = seeked forward
+
+    const isEarlyClose = usingRemote
+      ? openMs < EARLY_CLOSE_REMOTE_MS
+      : (!downloadDone && openMs < EARLY_CLOSE_REMOTE_MS) || (downloadDone && openMs < EARLY_CLOSE_LOCAL_MS);
+
+    if (!isEarlyClose || relaunchCount >= MAX_RELAUNCHES) {
+      // Normal exit — user watched long enough or we've exhausted relaunches
+      break vlcLoop;
     }
-    if (vlcDone) break;
 
-    const watchedMs = Date.now() - vlcOpenedAt;
+    // Early close: decide what to relaunch
+    relaunchCount++;
 
-    if (!downloadDone && !usingRemote && relaunchCount < MAX_RELAUNCHES && watchedMs < 120_000) {
-      // Seeked past cached data — switch to remote URL so VLC streams freely
-      relaunchCount++;
+    if (!downloadDone && !usingRemote) {
+      // Seeked past cached data → switch to remote HTTP stream
       usingRemote = true;
-      console.log(`\n[cache] Seeked past buffer — streaming remote URL…`);
+      console.log(`\n[cache] Seeked past buffer — streaming remote URL… (relaunch ${relaunchCount}/${MAX_RELAUNCHES})`);
       launchRemote(episodeUrl);
-      console.log("[VLC relaunched with remote URL]");
-    } else if (usingRemote && relaunchCount < MAX_RELAUNCHES && watchedMs < 120_000) {
-      // Already on remote stream, relaunch it
-      relaunchCount++;
-      console.log(`\n[cache] Relaunching remote stream…`);
+    } else if (usingRemote) {
+      // Remote stream closed early again (network hiccup?) → relaunch remote
+      console.log(`\n[cache] Remote stream closed early — relaunching… (relaunch ${relaunchCount}/${MAX_RELAUNCHES})`);
       launchRemote(episodeUrl);
-    } else if (downloadDone && relaunchCount < MAX_RELAUNCHES && watchedMs < 30_000) {
-      // Download finished but VLC closed suspiciously fast — relaunch local
-      relaunchCount++;
-      console.log(`\n[cache] Relaunching VLC…`);
-      launchLocal(canonicalPath) || launchRemote(episodeUrl);
     } else {
-      vlcDone = true;
+      // Download done but VLC crashed immediately → relaunch local
+      console.log(`\n[cache] VLC closed unexpectedly — relaunching… (relaunch ${relaunchCount}/${MAX_RELAUNCHES})`);
+      launchLocal(canonicalPath) || launchRemote(episodeUrl);
     }
+    // Continue the loop to wait for the newly launched instance
   }
 
   process.off("SIGINT", sigintHandler);
