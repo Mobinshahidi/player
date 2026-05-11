@@ -1199,30 +1199,23 @@ export async function playWithVlcAndroid(
   console.log(`\nDownloading: ${cleanFilename(localPath)}`);
   if (startTime > 0) console.log(`Will resume from: ${formatTime(startTime)}`);
 
-  // Start download first — wait until we have enough data before opening VLC.
-  // On Termux, passing the remote URL to VLC works but gives no seek/resume control.
-  // Passing the local file path works much better once enough is buffered.
   let downloadDone = false;
-const dl = startDownload(episodeUrl, localPath, 0, () => {
-  downloadDone = true;
-});
+  const dl = startDownload(episodeUrl, localPath, 0, () => {
+    downloadDone = true;
+  });
 
-// On Termux, lower the threshold to 512 KB — connections are fast enough
-// that 2 MB may never be seen mid-download before it completes.
-const TERMUX_MIN_BUFFER = 524_288; // 512 KB
-console.log("[cache] Waiting for initial buffer…");
-const startWait = Date.now();
-for (let i = 0; i < 600; i++) {
-  await new Promise((r) => setTimeout(r, 100));
-  if (downloadDone) break;
-  try {
-    if (existsSync(localPath) && videoFileSize(localPath) >= 131_072) break; // 128 KB
-  } catch {}
-  if (Date.now() - startWait > 60_000) break;
-}
+  // Wait for 128 KB before opening VLC — enough for a valid container header.
+  console.log("[cache] Waiting for initial buffer…");
+  const startWait = Date.now();
+  for (let i = 0; i < 600; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    if (downloadDone) break;
+    try {
+      if (existsSync(localPath) && videoFileSize(localPath) >= 131_072) break;
+    } catch {}
+    if (Date.now() - startWait > 60_000) break;
+  }
 
-  // Normalize to canonical path — /sdcard is a symlink that Android's
-  // FileProvider refuses to resolve, causing silent failures in VLC.
   const canonicalPath = localPath.replace(/^\/sdcard\//, "/storage/emulated/0/");
   const posMs = Math.floor(startTime * 1000);
   const extras =
@@ -1230,78 +1223,28 @@ for (let i = 0; i < 600; i++) {
       ? `--el position ${posMs} --ez from_start false`
       : `--ez from_start true`;
 
-  // Android 7+ blocks file:// URIs between apps (FileUriExposedException).
-  // Strategy (most to least reliable):
-  //   1. termux-open  — Termux FileProvider bridge, works for local files
-  //   2. termux-share — opens Android chooser, user picks VLC
-  //   3. termux-am    — Termux's am wrapper, correct permissions on Android 10+
-  //   4. bare am      — last resort, may lack permissions on newer ROMs
-  //
-  // VLC modern entry point is .StartActivity (legacy .gui.video.VideoPlayerActivity
-  // still works on older builds as a fallback).
-
   function launchLocal(path: string): boolean {
-  // 1. termux-open with content type (Termux FileProvider bridge)
-  try {
-    execSync(`termux-open "${path}"`, {
-        stdio: "ignore", timeout: 6000,
-    });
-    return true;
-  } catch {}
-
-  // 2. termux-am with a VIEW intent on the file:// URI (works on GrapheneOS)
-  try {
-    execSync(
-      `termux-am start -a android.intent.action.VIEW -d "file://${path}" -t "video/*" -n "${VLC_PACKAGE}/.StartActivity" --grant-read-uri-permission`,
-      { stdio: "ignore", timeout: 6000 },
-    );
-    return true;
-  } catch {}
-
-  // 3. termux-am without component (implicit, lets Android resolve to VLC)
-  try {
-    execSync(
-      `termux-am start -a android.intent.action.VIEW -d "file://${path}" -t "video/*" --grant-read-uri-permission`,
-      { stdio: "ignore", timeout: 6000 },
-    );
-    return true;
-  } catch {}
-
-  // 4. termux-share as last local fallback
-  try {
-    execSync(`termux-share -a view "${path}"`, {
-      stdio: "ignore", timeout: 6000,
-    });
-    return true;
-  } catch {}
-
-  return false;
-}
+    try {
+      execSync(`termux-open "${path}"`, { stdio: "ignore", timeout: 6000 });
+      return true;
+    } catch {}
+    try {
+      execSync(`termux-share -a view "${path}"`, { stdio: "ignore", timeout: 6000 });
+      return true;
+    } catch {}
+    return false;
+  }
 
   function launchRemote(url: string): boolean {
     const viewIntent = `-a android.intent.action.VIEW -d "${url}" -t "video/*" ${extras}`;
-    // Try termux-am first (has correct permissions on Android 10+)
     try {
       execSync(`termux-am start ${viewIntent}`, { stdio: "ignore", timeout: 6000 });
       return true;
     } catch {}
-    // Modern VLC activity name
     try {
-      execSync(
-        `am start -n "${VLC_PACKAGE}/.StartActivity" ${viewIntent}`,
-        { stdio: "ignore", timeout: 6000 },
-      );
+      execSync(`am start -n "${VLC_PACKAGE}/.StartActivity" ${viewIntent}`, { stdio: "ignore", timeout: 6000 });
       return true;
     } catch {}
-    // Legacy VLC activity name
-    try {
-      execSync(
-        `am start -n "${VLC_PACKAGE}/.gui.video.VideoPlayerActivity" ${viewIntent}`,
-        { stdio: "ignore", timeout: 6000 },
-      );
-      return true;
-    } catch {}
-    // Implicit intent — no component name
     try {
       execSync(`am start ${viewIntent}`, { stdio: "ignore", timeout: 6000 });
       return true;
@@ -1316,51 +1259,56 @@ for (let i = 0; i < 600; i++) {
     console.error("[Could not launch VLC — open manually]");
     console.log(`  Local file: ${localPath}`);
   }
-// ── Wait for VLC — relaunch if it exits early (seek past cached data) ──────
-let vlcDone = false;
-let relaunchCount = 0;
-const MAX_RELAUNCHES = 5;
 
-// Allow Ctrl+C to break out of the VLC wait loop
-process.once("SIGINT", () => {
-  vlcDone = true;
-  try { dl.kill(); } catch {}
-  console.log("\n[interrupted]");
-});
+  // Wait for VLC to close.
+  // - 3 consecutive misses = VLC really closed (debounce false positives)
+  // - If VLC exits early and download still running = seeked past cache, relaunch
+  // - SIGINT breaks out cleanly
+  let vlcDone = false;
+  let relaunchCount = 0;
+  const MAX_RELAUNCHES = 5;
 
-while (!vlcDone) {
-  // Give VLC time to start before polling
-  await new Promise((r) => setTimeout(r, 8000));
+  const sigintHandler = () => {
+    vlcDone = true;
+    try { dl.kill(); } catch {}
+    console.log("\n[interrupted — saving progress]");
+  };
+  process.once("SIGINT", sigintHandler);
 
-  // Wait for VLC to close, with 3-miss debounce
-  let missCount = 0;
-  for (let i = 0; i < 9600; i++) {
-    await new Promise((r) => setTimeout(r, 2000));
-    if (!isVlcRunning()) {
-      missCount++;
-      if (missCount >= 3) break;
+  while (!vlcDone) {
+    await new Promise((r) => setTimeout(r, 8000));
+    let missCount = 0;
+    for (let i = 0; i < 9600 && !vlcDone; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      if (!isVlcRunning()) {
+        missCount++;
+        if (missCount >= 3) break;
+      } else {
+        missCount = 0;
+      }
+    }
+    if (vlcDone) break;
+
+    // VLC closed — was it because download finished normally, or seeked past cache?
+    if (!downloadDone && relaunchCount < MAX_RELAUNCHES) {
+      const sizeMB = videoFileSize(localPath) / 1_048_576;
+      console.log(`\n[cache] ${sizeMB.toFixed(1)} MB cached — waiting for more data…`);
+      relaunchCount++;
+      // Wait up to 10s for more data then relaunch
+      for (let i = 0; i < 50 && !downloadDone; i++) {
+        await new Promise((r) => setTimeout(r, 200));
+        if (videoFileSize(localPath) > sizeMB * 1_048_576 + 2_097_152) break;
+      }
+      console.log("[cache] Relaunching VLC…");
+      launchLocal(canonicalPath) || launchRemote(episodeUrl);
     } else {
-      missCount = 0;
+      vlcDone = true;
     }
   }
 
-  // Check if the download is still ongoing and file is still growing
-  // If so, VLC likely exited because it hit the end of cached data — relaunch
-  if (!downloadDone && relaunchCount < MAX_RELAUNCHES) {
-    const sizeMB = videoFileSize(localPath) / 1_048_576;
-    console.log(`\n[cache] VLC closed early — ${sizeMB.toFixed(1)} MB cached so far, relaunching…`);
-    relaunchCount++;
-    // Small wait for more data to buffer before relaunching
-    await new Promise((r) => setTimeout(r, 3000));
-    launchLocal(canonicalPath) || launchRemote(episodeUrl);
-    console.log("[VLC relaunched]");
-  } else {
-    vlcDone = true;
-  }
-}
-
-try { dl.kill(); } catch {}
-console.log("\n[Video player closed]\n");
+  process.off("SIGINT", sigintHandler);
+  try { dl.kill(); } catch {}
+  console.log("\n[Video player closed]\n");
 
   const done = prompts
     ? await prompts.yn("Did you finish the episode? [Y/n]: ")
@@ -1375,9 +1323,7 @@ console.log("\n[Video player closed]\n");
     };
   }
   const raw = prompts
-    ? await prompts.ask(
-        "Stopped at (e.g. 32:10 or 1:05:30, Enter = keep old position): ",
-      )
+    ? await prompts.ask("Stopped at (e.g. 32:10 or 1:05:30, Enter = keep old position): ")
     : "";
   const secs = parseTimeInput(raw);
   if (secs > 0) console.log(`Position saved: ${formatTime(secs)}`);
