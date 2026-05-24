@@ -6,8 +6,8 @@ node_modules
 progress-export.json
 series-exported.json
 progress-export-2.json
+.mpv-web-player/*
 .mpv-web-player/
-.mpv-web-player/progress.json
 *.js.map
 .env
 .env.*
