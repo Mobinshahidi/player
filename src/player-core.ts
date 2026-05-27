@@ -3,7 +3,7 @@
 
 import { EventEmitter } from "events";
 import { spawn, execSync, type ChildProcess } from "child_process";
-import { createHash, createHmac } from "crypto";
+import { createHash } from "crypto";
 import {
   existsSync,
   readFileSync,
@@ -16,6 +16,19 @@ import { homedir } from "os";
 import { join } from "path";
 import net from "net";
 import { CacheManager } from "./cache-manager.js";
+import {
+  StorageService,
+  S3StorageProvider,
+  checkSecretsFilePermissions,
+  findSecretsFile,
+  readEnvConfig,
+  readSecretsFile,
+  readStorageConfig,
+  resolveStorageSelection,
+  writeStorageConfig,
+  type StorageMode,
+  type StorageProviderName,
+} from "./storage.js";
 
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 process.removeAllListeners("warning");
@@ -63,12 +76,21 @@ export interface SeriesProgress {
 export type ProgressStore = Record<string, SeriesProgress>;
 export type DeletionLog = Record<string, string>;
 
-export const ARVAN_ACCESS = process.env.PLAYER_ARVAN_ACCESS_KEY || "";
-export const ARVAN_SECRET = process.env.PLAYER_ARVAN_SECRET_KEY || "";
-export const ARVAN_BUCKET = process.env.PLAYER_ARVAN_BUCKET || "";
-export const ARVAN_REGION = process.env.PLAYER_ARVAN_REGION || "ir-thr-at1";
-export const ARVAN_FILE = "mpv-progress.json";
-export const ARVAN_SYNC = !!(ARVAN_ACCESS && ARVAN_SECRET && ARVAN_BUCKET);
+export interface PlayerSettings {
+  lastOpenedAt?: string;
+  ui?: {
+    playInKitty?: boolean;
+  };
+}
+
+export interface Playlist {
+  id: string;
+  name: string;
+  items: string[];
+  updatedAt?: string;
+}
+
+export type Playlists = Playlist[];
 
 export const SCRIPT_DIR = (() => {
   try {
@@ -84,8 +106,20 @@ export const CONFIG_DIR =
   process.env.PLAYER_CONFIG_DIR || join(SCRIPT_DIR, ".mpv-web-player");
 export const CACHE_DIR = join(CONFIG_DIR, "cache");
 export const PROGRESS_FILE = join(CONFIG_DIR, "progress.json");
+export const SETTINGS_FILE = join(CONFIG_DIR, "settings.json");
+export const PLAYLISTS_FILE = join(CONFIG_DIR, "playlists.json");
 export const VIDEO_DIR = join(SCRIPT_DIR, "video-cache");
 export const MPV_SOCKET = join(CONFIG_DIR, "mpv.sock");
+
+export const STORAGE_CONFIG_FILE = join(CONFIG_DIR, "storage.json");
+export const SECRETS_FILE_CANDIDATES = [
+  process.env.PLAYER_SECRETS_FILE,
+  join(CONFIG_DIR, "player-secrets.toml"),
+  join(SCRIPT_DIR, ".mpv-player-secrets"),
+].filter(Boolean) as string[];
+export const REMOTE_PROGRESS_KEY = "mpv-progress.json";
+export const REMOTE_SETTINGS_KEY = "player-settings.json";
+export const REMOTE_PLAYLISTS_KEY = "player-playlists.json";
 
 export const IS_TERMUX =
   process.env.PREFIX?.includes("com.termux") ||
@@ -100,6 +134,46 @@ export const TERMUX_VIDEO_DIR = IS_TERMUX
   : VIDEO_DIR;
 export const END_THRESHOLD_SECONDS = 60;
 export const END_THRESHOLD_RATIO = 0.95;
+
+export let storageMode: StorageMode = "local";
+export let storageProvider: StorageProviderName | null = null;
+export let CLOUD_SYNC = false;
+export let storageService: StorageService | null = null;
+export let storageWarnings: string[] = [];
+
+export interface StorageBootstrapState {
+  needsPrompt: boolean;
+  hasStorageConfig: boolean;
+  hasSecretsFile: boolean;
+  secretsPath: string | null;
+  configPath: string;
+}
+
+export function getStorageBootstrapState(): StorageBootstrapState {
+  const config = readStorageConfig(STORAGE_CONFIG_FILE);
+  const secretsPath = findSecretsFile(SECRETS_FILE_CANDIDATES);
+  return {
+    needsPrompt: !config && !secretsPath,
+    hasStorageConfig: !!config,
+    hasSecretsFile: !!secretsPath,
+    secretsPath,
+    configPath: STORAGE_CONFIG_FILE,
+  };
+}
+
+export function setStorageModeChoice(
+  mode: StorageMode,
+  provider?: StorageProviderName,
+): void {
+  writeStorageConfig(STORAGE_CONFIG_FILE, {
+    mode,
+    provider,
+  });
+}
+
+export function getPreferredSecretsPath(): string {
+  return process.env.PLAYER_SECRETS_FILE || join(SCRIPT_DIR, ".mpv-player-secrets");
+}
 
 // ─── QUIT SENTINEL ───────────────────────────────────────────────────────────
 
@@ -211,67 +285,7 @@ export function findMpv(): string {
   );
 }
 
-// ─── ARVANCLOUD S3 ───────────────────────────────────────────────────────────
-
-export function sha256hex(d: string | Buffer) {
-  return createHash("sha256").update(d).digest("hex");
-}
-export function hmacSha256(k: Buffer | string, d: string): Buffer {
-  return createHmac("sha256", k).update(d).digest();
-}
-export function getSigningKey(
-  sec: string,
-  date: string,
-  region: string,
-  svc: string,
-): Buffer {
-  return hmacSha256(
-    hmacSha256(hmacSha256(hmacSha256("AWS4" + sec, date), region), svc),
-    "aws4_request",
-  );
-}
-
-export async function s3Request(
-  method: "GET" | "PUT",
-  body?: Buffer,
-): Promise<Response> {
-  const now = new Date();
-  const dateStr = now.toISOString().replace(/[-:]/g, "").replace(/\.\d+/, "");
-  const dateOnly = dateStr.slice(0, 8);
-  const host = `${ARVAN_BUCKET}.s3.${ARVAN_REGION}.arvanstorage.ir`;
-  const url = `https://${host}/${ARVAN_FILE}`;
-  const hash = sha256hex(body ?? Buffer.alloc(0));
-  const sh =
-    method === "PUT"
-      ? "content-type;host;x-amz-content-sha256;x-amz-date"
-      : "host;x-amz-content-sha256;x-amz-date";
-  const ch =
-    method === "PUT"
-      ? `content-type:application/json\nhost:${host}\nx-amz-content-sha256:${hash}\nx-amz-date:${dateStr}\n`
-      : `host:${host}\nx-amz-content-sha256:${hash}\nx-amz-date:${dateStr}\n`;
-  const canonical = [method, `/${ARVAN_FILE}`, "", ch, sh, hash].join("\n");
-  const scope = `${dateOnly}/${ARVAN_REGION}/s3/aws4_request`;
-  const sts = ["AWS4-HMAC-SHA256", dateStr, scope, sha256hex(canonical)].join(
-    "\n",
-  );
-  const sig = hmacSha256(
-    getSigningKey(ARVAN_SECRET, dateOnly, ARVAN_REGION, "s3"),
-    sts,
-  ).toString("hex");
-  const auth = `AWS4-HMAC-SHA256 Credential=${ARVAN_ACCESS}/${scope}, SignedHeaders=${sh}, Signature=${sig}`;
-  const headers: Record<string, string> = {
-    Host: host,
-    "x-amz-date": dateStr,
-    "x-amz-content-sha256": hash,
-    Authorization: auth,
-  };
-  if (method === "PUT") headers["Content-Type"] = "application/json";
-  return fetch(url, {
-    method,
-    headers,
-    body: body ? new Uint8Array(body) : undefined,
-  });
-}
+// ─── STORAGE (LOCAL + CLOUD SYNC) ───────────────────────────────────────────
 
 // ─── PROGRESS STORE ──────────────────────────────────────────────────────────
 
@@ -283,6 +297,8 @@ export function ensureConfigDir() {
 }
 
 export let deletionLog: DeletionLog = {};
+export let settings: PlayerSettings = {};
+export let playlists: Playlists = [];
 
 export function loadLocalStore(): ProgressStore {
   if (!existsSync(PROGRESS_FILE)) return {};
@@ -309,26 +325,72 @@ export function saveLocalStore(s: ProgressStore) {
   writeFileSync(PROGRESS_FILE, JSON.stringify(toSave, null, 2));
 }
 
-export async function pullFromArvan(): Promise<ProgressStore | null> {
+interface SettingsFile {
+  updatedAt: string;
+  data: PlayerSettings;
+}
+
+interface PlaylistsFile {
+  updatedAt: string;
+  data: Playlists;
+}
+
+function loadSettingsLocal(): SettingsFile | null {
+  if (!existsSync(SETTINGS_FILE)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(SETTINGS_FILE, "utf-8"));
+    if (raw && typeof raw === "object" && raw.data) {
+      return raw as SettingsFile;
+    }
+  } catch {}
+  return null;
+}
+
+function saveSettingsLocal(s: PlayerSettings) {
+  ensureConfigDir();
+  const wrapped: SettingsFile = {
+    updatedAt: new Date().toISOString(),
+    data: s,
+  };
+  writeFileSync(SETTINGS_FILE, JSON.stringify(wrapped, null, 2));
+}
+
+function loadPlaylistsLocal(): PlaylistsFile | null {
+  if (!existsSync(PLAYLISTS_FILE)) return null;
+  try {
+    const raw = JSON.parse(readFileSync(PLAYLISTS_FILE, "utf-8"));
+    if (raw && typeof raw === "object" && Array.isArray(raw.data)) {
+      return raw as PlaylistsFile;
+    }
+  } catch {}
+  return null;
+}
+
+function savePlaylistsLocal(p: Playlists) {
+  ensureConfigDir();
+  const wrapped: PlaylistsFile = {
+    updatedAt: new Date().toISOString(),
+    data: p,
+  };
+  writeFileSync(PLAYLISTS_FILE, JSON.stringify(wrapped, null, 2));
+}
+
+export async function pullFromCloud(): Promise<ProgressStore | null> {
+  if (!storageService?.isCloudEnabled()) return null;
   setSyncStatus("syncing");
   try {
-    const res = await s3Request("GET");
-    if (res.status === 404) {
+    const raw = await storageService.getRemoteFile(REMOTE_PROGRESS_KEY);
+    if (!raw) {
       setSyncStatus("ok");
       return null;
     }
-    if (!res.ok) {
-      setSyncStatus("error", `GET failed: ${res.status}`);
-      console.warn(`[sync] GET failed: ${res.status}`);
-      return null;
-    }
-    const raw = (await res.json()) as any;
+    const parsed = JSON.parse(raw.toString("utf-8")) as any;
     setSyncStatus("ok");
-    if (raw && typeof raw.url === "string") {
-      const k = seriesKeyFromUrl(raw.url);
-      return { [k]: raw };
+    if (parsed && typeof parsed.url === "string") {
+      const k = seriesKeyFromUrl(parsed.url);
+      return { [k]: parsed };
     }
-    return raw as ProgressStore;
+    return parsed as ProgressStore;
   } catch (e) {
     setSyncStatus("error", (e as Error).message);
     console.warn("[sync] Pull failed:", (e as Error).message);
@@ -336,16 +398,17 @@ export async function pullFromArvan(): Promise<ProgressStore | null> {
   }
 }
 
-export async function pushToArvan(s: ProgressStore) {
+export async function pushToCloud(s: ProgressStore) {
+  if (!storageService?.isCloudEnabled()) return;
   setSyncStatus("syncing");
   try {
-    const res = await s3Request("PUT", Buffer.from(JSON.stringify(s, null, 2)));
-    if (!res.ok) {
-      setSyncStatus("error", `Push failed: ${res.status}`);
-      console.warn(`[sync] Push failed: ${res.status}`);
-    } else {
-      setSyncStatus("ok");
-    }
+    await storageService.putRemoteFile(
+      REMOTE_PROGRESS_KEY,
+      Buffer.from(JSON.stringify(s, null, 2)),
+      "application/json",
+    );
+    await pushAuxiliaryFiles();
+    setSyncStatus("ok");
   } catch (e) {
     setSyncStatus("error", (e as Error).message);
     console.warn("[sync] Push failed:", (e as Error).message);
@@ -386,7 +449,87 @@ export function mergeStores(
   return { merged, remoteWon };
 }
 
+async function pullAuxiliaryFiles(): Promise<void> {
+  if (!storageService?.isCloudEnabled()) return;
+  try {
+    const rawSettings = await storageService.getRemoteFile(REMOTE_SETTINGS_KEY);
+    if (rawSettings) {
+      const remote = JSON.parse(rawSettings.toString("utf-8")) as SettingsFile;
+      const local = loadSettingsLocal();
+      const remoteUpdated = new Date(remote.updatedAt || 0).getTime();
+      const localUpdated = new Date(local?.updatedAt || 0).getTime();
+      if (!local || remoteUpdated > localUpdated) {
+        settings = remote.data ?? {};
+        saveSettingsLocal(settings);
+      }
+    }
+  } catch (e) {
+    console.warn("[sync] Settings pull failed:", (e as Error).message);
+  }
+  try {
+    const rawPlaylists = await storageService.getRemoteFile(REMOTE_PLAYLISTS_KEY);
+    if (rawPlaylists) {
+      const remote = JSON.parse(rawPlaylists.toString("utf-8")) as PlaylistsFile;
+      const local = loadPlaylistsLocal();
+      const remoteUpdated = new Date(remote.updatedAt || 0).getTime();
+      const localUpdated = new Date(local?.updatedAt || 0).getTime();
+      if (!local || remoteUpdated > localUpdated) {
+        playlists = Array.isArray(remote.data) ? remote.data : [];
+        savePlaylistsLocal(playlists);
+      }
+    }
+  } catch (e) {
+    console.warn("[sync] Playlists pull failed:", (e as Error).message);
+  }
+}
+
+async function pushAuxiliaryFiles(): Promise<void> {
+  if (!storageService?.isCloudEnabled()) return;
+  const settingsLocal = loadSettingsLocal();
+  if (settingsLocal) {
+    await storageService.putRemoteFile(
+      REMOTE_SETTINGS_KEY,
+      Buffer.from(JSON.stringify(settingsLocal, null, 2)),
+      "application/json",
+    );
+  }
+  const playlistsLocal = loadPlaylistsLocal();
+  if (playlistsLocal) {
+    await storageService.putRemoteFile(
+      REMOTE_PLAYLISTS_KEY,
+      Buffer.from(JSON.stringify(playlistsLocal, null, 2)),
+      "application/json",
+    );
+  }
+}
+
 export let store: ProgressStore = {};
+
+export function loadSettings(): PlayerSettings {
+  const local = loadSettingsLocal();
+  settings = local?.data ?? { lastOpenedAt: new Date().toISOString() };
+  if (!local) saveSettingsLocal(settings);
+  return settings;
+}
+
+export function saveSettings(next: PlayerSettings, immediate = false) {
+  settings = next;
+  saveSettingsLocal(settings);
+  schedulePush(immediate);
+}
+
+export function loadPlaylists(): Playlists {
+  const local = loadPlaylistsLocal();
+  playlists = local?.data ?? [];
+  if (!local) savePlaylistsLocal(playlists);
+  return playlists;
+}
+
+export function savePlaylists(next: Playlists, immediate = false) {
+  playlists = next;
+  savePlaylistsLocal(playlists);
+  schedulePush(immediate);
+}
 
 // Remove entries whose key is purely numeric — these are garbage entries
 // created by the old importProgress that treated array indices as keys.
@@ -409,8 +552,71 @@ export function cleanGarbageEntries(s: ProgressStore): {
   return { cleaned, removed };
 }
 
+async function initStorage(): Promise<void> {
+  const config = readStorageConfig(STORAGE_CONFIG_FILE);
+  const secretsPath = findSecretsFile(SECRETS_FILE_CANDIDATES);
+  let secrets = null;
+  if (secretsPath) {
+    try {
+      secrets = readSecretsFile(secretsPath);
+    } catch (e) {
+      setSyncStatus("error", (e as Error).message);
+      console.warn(
+        `[storage] Failed to parse secrets file (${secretsPath}). Using local-only storage.`,
+      );
+    }
+  }
+  const envConfig = readEnvConfig(process.env);
+  const selection = resolveStorageSelection({
+    config,
+    secrets,
+    env: envConfig,
+    secretsPath,
+  });
+  storageMode = selection.mode;
+  storageProvider = selection.provider ?? null;
+  storageWarnings = selection.warnings;
+  if (storageWarnings.length > 0) {
+    for (const w of storageWarnings) console.warn(`[storage] ${w}`);
+  }
+  if (secretsPath) {
+    const permWarning = checkSecretsFilePermissions(secretsPath);
+    if (permWarning) console.warn(`[storage] ${permWarning}`);
+  }
+  if (selection.errors.length > 0 && selection.mode === "cloud") {
+    const msg = selection.errors.join(", ");
+    setSyncStatus("error", msg);
+    console.warn(
+      `[storage] Cloud config error (${msg}). Using local-only storage for now.`,
+    );
+  }
+  const remote =
+    selection.mode === "cloud" && selection.s3 && selection.errors.length === 0
+      ? new S3StorageProvider(selection.s3)
+      : null;
+  storageService = new StorageService(
+    selection.mode,
+    selection.provider ?? null,
+    remote,
+  );
+  CLOUD_SYNC = storageService.isCloudEnabled();
+  if (CLOUD_SYNC) {
+    try {
+      await storageService.validateRemoteAccess();
+    } catch (e) {
+      setSyncStatus("error", (e as Error).message);
+      console.warn(
+        `[storage] Cloud validation failed: ${(e as Error).message}. Using local-only storage.`,
+      );
+      storageService.disableRemote();
+      CLOUD_SYNC = false;
+    }
+  }
+}
+
 export async function initStore() {
   ensureConfigDir();
+  await initStorage();
   store = loadLocalStore();
   // Clean up any garbage numeric-key entries from a bad import
   const { cleaned, removed } = cleanGarbageEntries(store);
@@ -471,20 +677,24 @@ export async function initStore() {
       );
     }
   }
-  if (!ARVAN_SYNC) return;
-  process.stdout.write("[sync] Pulling from ArvanCloud... ");
-  const remote = await pullFromArvan();
+  loadSettings();
+  loadPlaylists();
+  if (!CLOUD_SYNC) return;
+  process.stdout.write("[sync] Pulling from cloud storage... ");
+  const remote = await pullFromCloud();
   if (!remote) {
     console.log(
       Object.keys(store).length
         ? "no remote yet, using local."
         : "no progress found.",
     );
+    await pullAuxiliaryFiles();
     return;
   }
   const { merged, remoteWon } = mergeStores(store, remote);
   store = merged;
   saveLocalStore(store);
+  await pullAuxiliaryFiles();
   console.log(
     remoteWon.length
       ? `remote ahead for: ${remoteWon.join(", ")}`
@@ -495,18 +705,18 @@ export async function initStore() {
 export let pushTimer: ReturnType<typeof setTimeout> | null = null;
 
 export function schedulePush(immediate = false) {
-  if (!ARVAN_SYNC) return;
+  if (!CLOUD_SYNC) return;
   if (pushTimer) {
     clearTimeout(pushTimer);
     pushTimer = null;
   }
   if (immediate) {
-    pushToArvan(store);
+    pushToCloud(store);
     return;
   }
   pushTimer = setTimeout(() => {
     pushTimer = null;
-    pushToArvan(store);
+    pushToCloud(store);
   }, 30_000);
 }
 
@@ -515,9 +725,9 @@ export async function flushSync() {
     clearTimeout(pushTimer);
     pushTimer = null;
   }
-  if (ARVAN_SYNC) {
-    process.stdout.write("[sync] Pushing to ArvanCloud... ");
-    await pushToArvan(store);
+  if (CLOUD_SYNC) {
+    process.stdout.write("[sync] Pushing to cloud storage... ");
+    await pushToCloud(store);
     console.log("done.");
   }
 }

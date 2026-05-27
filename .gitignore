@@ -3,9 +3,14 @@ video-cache/
 node-modules
 node_modules
 .mpv-player-secrets
+player-secrets.toml
+.player-secrets
+.player-secrets.toml
+.player-secrets.*
 progress-export.json
 series-exported.json
 progress-export-2.json
+player.log
 .mpv-web-player/*
 .mpv-web-player/
 *.js.map

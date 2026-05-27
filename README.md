@@ -1,6 +1,6 @@
 # Player
 
-Terminal-first media player with a fast TUI, a CLI mode, local progress tracking, and optional ArvanCloud S3 sync.
+Terminal-first media player with a fast TUI, a CLI mode, local progress tracking, and optional S3-compatible cloud sync.
 
 ## Features
 
@@ -13,10 +13,10 @@ Terminal-first media player with a fast TUI, a CLI mode, local progress tracking
 - Download resume with exponential-backoff retry on partial transfers
 - Cache progress shown in mpv OSD (desktop)
 - Delete local cache files after watching
-- Hardsub export helper (if  [stoh](https://github.com/Mobinshahidi/stoh) + `ffprobe` are installed)
+- Hardsub export helper (if [stoh](https://github.com/Mobinshahidi/stoh) + `ffprobe` are installed)
 - Import/export to the series-project JSON format
 - Deduplicate series-project JSON files
-- Optional ArvanCloud S3 sync across devices
+- Optional S3-compatible cloud sync across devices (Arvan, AWS S3, Cloudflare R2)
 - Termux/VLC support on Android (GrapheneOS compatible)
 
 ## Requirements
@@ -50,47 +50,47 @@ npm install -g tsx
 ## Run (TUI) — Desktop only
 
 ```bash
-npx tsx tui.ts
+npx tsx src/tui.ts
 ```
 
 Detach into a new Kitty window:
 
 ```bash
-npx tsx tui.ts --detach
+npx tsx src/tui.ts --detach
 ```
 
 ## Run (CLI)
 
 ```bash
-npx tsx player.ts
+npx tsx src/player.ts
 ```
 
 List, export, import from the command line:
 
 ```bash
-npx tsx player.ts list
-npx tsx player.ts export
-npx tsx player.ts import /path/to/series.json
+npx tsx src/player.ts list
+npx tsx src/player.ts export
+npx tsx src/player.ts import /path/to/series.json
 ```
 
 ## TUI Keys
 
-| Key | Action |
-|-----|--------|
-| `j` / `k` or arrows | Move up/down |
-| `Enter` | Play selected |
-| `/` | Search |
-| `n` | New entry |
-| `e` | Edit entry |
-| `f` | Toggle finished |
-| `r` | Rename |
-| `d` | Delete |
-| `D` | Multi-delete |
-| `i` | Import |
-| `x` | Export |
-| `u` | Dedupe series JSON file |
-| `s` | Force sync to ArvanCloud |
-| `q` | Quit |
+| Key                 | Action                  |
+| ------------------- | ----------------------- |
+| `j` / `k` or arrows | Move up/down            |
+| `Enter`             | Play selected           |
+| `/`                 | Search                  |
+| `n`                 | New entry               |
+| `e`                 | Edit entry              |
+| `f`                 | Toggle finished         |
+| `r`                 | Rename                  |
+| `d`                 | Delete                  |
+| `D`                 | Multi-delete            |
+| `i`                 | Import                  |
+| `x`                 | Export                  |
+| `u`                 | Dedupe series JSON file |
+| `s`                 | Force cloud sync        |
+| `q`                 | Quit                    |
 
 ## Android / Termux Setup
 
@@ -111,10 +111,10 @@ npm install -g tsx
 
 ```bash
 cd ~/player
-npx tsx player.ts
+npx tsx src/player.ts
 ```
 
-The TUI (`tui.ts`) is desktop-only. On Termux, use the CLI (`player.ts`).
+The TUI ([src/tui.ts](src/tui.ts)) is desktop-only. On Termux, use the CLI ([src/player.ts](src/player.ts)).
 
 ### How playback works on Android
 
@@ -143,12 +143,16 @@ export PLAYER_TERMUX_VIDEO_DIR=/storage/emulated/0/MyFolder
 
 ## Data & Files
 
-| Path | Purpose |
-|------|---------|
-| `<project>/.mpv-web-player/progress.json` | Watch progress store |
-| `<project>/.mpv-web-player/cache/` | Episode list cache (1 h TTL) |
-| `<project>/video-cache/` | Downloaded video files (desktop) |
-| `/storage/emulated/0/player-cache/` | Downloaded video files (Termux) |
+| Path                                       | Purpose                              |
+| ------------------------------------------ | ------------------------------------ |
+| `<project>/.mpv-web-player/progress.json`  | Watch progress store                 |
+| `<project>/.mpv-web-player/storage.json`   | Storage mode selection (local/cloud) |
+| `<project>/.mpv-web-player/settings.json`  | Settings/preferences (syncable)      |
+| `<project>/.mpv-web-player/playlists.json` | Playlists (syncable)                 |
+| `<project>/.mpv-player-secrets`            | Optional secrets file for cloud sync |
+| `<project>/.mpv-web-player/cache/`         | Episode list cache (1 h TTL)         |
+| `<project>/video-cache/`                   | Downloaded video files (desktop)     |
+| `/storage/emulated/0/player-cache/`        | Downloaded video files (Termux)      |
 
 Override the config root:
 
@@ -156,27 +160,104 @@ Override the config root:
 export PLAYER_CONFIG_DIR=/path/to/dir
 ```
 
-## ArvanCloud S3 Sync
+## Storage Modes & Cloud Sync
 
-Progress can be synced across devices (e.g. desktop ↔ phone) via an ArvanCloud S3 bucket. The sync file is stored as `mpv-progress.json` in the bucket.
+On first run, the app asks:
 
-### Setup
+"Do you want to store your data locally only, or sync to a cloud provider (Arvan, AWS S3, Cloudflare R2, etc.)?"
 
-Create a bucket in the [ArvanCloud console](https://panel.arvancloud.ir), then set these environment variables:
+Options:
 
-```bash
-export PLAYER_ARVAN_ACCESS_KEY="your-access-key"
-export PLAYER_ARVAN_SECRET_KEY="your-secret-key"
-export PLAYER_ARVAN_BUCKET="your-bucket-name"
-export PLAYER_ARVAN_REGION="ir-thr-at1"   # default, change if needed
+- `local` — data stays on-device only.
+- `cloud` — data syncs to an S3-compatible provider.
+
+If you choose `cloud`, the app keeps working in local mode until a valid secrets file is present.
+
+### Secrets file (TOML)
+
+Create a secrets file at:
+
+- `<project>/.mpv-player-secrets`
+
+Or set `PLAYER_SECRETS_FILE` to point at a custom path.
+
+Example:
+
+```toml
+[storage]
+mode = "cloud"          # "local" or "cloud"
+provider = "arvan"      # "arvan", "aws-s3", "cloudflare-r2", "other-s3"
+
+[storage.arvan]
+access_key_id = "YOUR_ARVAN_ACCESS_KEY"
+secret_access_key = "YOUR_ARVAN_SECRET_KEY"
+endpoint_url = "https://s3.ir-thr-at1.arvanstorage.ir"
+bucket = "your-bucket-name"
+region = "ir-thr-at1"
+
+[storage.aws_s3]
+access_key_id = "YOUR_AWS_ACCESS_KEY"
+secret_access_key = "YOUR_AWS_SECRET_KEY"
+endpoint_url = "https://s3.us-east-1.amazonaws.com"
+bucket = "your-bucket-name"
+region = "us-east-1"
+
+[storage.cloudflare_r2]
+access_key_id = "YOUR_R2_ACCESS_KEY_ID"
+secret_access_key = "YOUR_R2_SECRET_ACCESS_KEY"
+endpoint_url = "https://<ACCOUNT_ID>.r2.cloudflarestorage.com"
+bucket = "your-bucket-name"
+
+[storage.other_s3]
+access_key_id = "YOUR_S3_ACCESS_KEY"
+secret_access_key = "YOUR_S3_SECRET_KEY"
+endpoint_url = "https://s3.example.com"
+bucket = "your-bucket-name"
+region = "us-east-1"
 ```
 
-Put these in your shell RC file (`~/.bashrc`, `~/.zshrc`, or Termux's `~/.bashrc`) so they are set on every session.
+Keep the secrets file readable only by you (recommended mode `600`). The app never logs secret values.
+
+You can start from the example file at [player-secrets.toml.example](player-secrets.toml.example).
+
+### Provider setup
+
+#### Arvan Cloud
+
+- Create an account and bucket in the Arvan panel.
+- Use one of these endpoints:
+  - Simin: `https://s3.ir-thr-at1.arvanstorage.ir`
+  - Shahriar: `https://s3.ir-tbz-sh1.arvanstorage.ir`
+- Docs:
+  - Credentials: https://docs.arvancloud.ir/en/developer-tools/sdk/object-storage/credentials/
+  - SDK guide: https://docs.arvancloud.ir/en/developer-tools/sdk/object-storage
+
+#### Cloudflare R2
+
+- Create a bucket and generate an API token.
+- Endpoint format: `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`
+- Docs:
+  - Tokens: https://developers.cloudflare.com/r2/api/tokens/
+  - S3 API: https://developers.cloudflare.com/r2/get-started/s3/
+
+#### Amazon S3
+
+- Create a bucket and IAM access key.
+- Endpoint format: `https://s3.<region>.amazonaws.com`
+- Docs: https://docs.aws.amazon.com/iam/ and https://docs.aws.amazon.com/s3/
+
+### Data synced
+
+- `progress.json` (playback history, deletion log, metadata)
+- `settings.json` (preferences)
+- `playlists.json` (playlists)
+
+Media files and video caches are not synced by default.
 
 ### How sync works
 
 - **On startup:** the player pulls the remote progress file and merges it with the local store. Remote entries only win if they are further ahead (higher season/episode/timestamp, or marked finished).
-- **During playback:** progress is saved locally after every episode and pushed to ArvanCloud with a 30-second debounce.
+- **During playback:** progress is saved locally after every episode and pushed to cloud storage with a 30-second debounce.
 - **On exit:** any pending push is flushed before the process ends.
 - **Deletions** are tracked in a deletion log so removed entries are not re-imported from the remote.
 - **Force sync** from the TUI: press `s`.
@@ -191,22 +272,28 @@ If you watch on two devices without syncing in between, the one that is further 
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PLAYER_ARVAN_ACCESS_KEY` | — | ArvanCloud access key (enables sync) |
-| `PLAYER_ARVAN_SECRET_KEY` | — | ArvanCloud secret key |
-| `PLAYER_ARVAN_BUCKET` | — | S3 bucket name |
-| `PLAYER_ARVAN_REGION` | `ir-thr-at1` | ArvanCloud region |
-| `PLAYER_CONFIG_DIR` | `<project>/.mpv-web-player` | Override config/progress directory |
-| `PLAYER_TERMUX_VIDEO_DIR` | `/storage/emulated/0/player-cache` | Override video cache dir on Termux |
-| `PLAYER_CURL_CONNECT_TIMEOUT` | `20` | curl connect timeout in seconds |
-| `PLAYER_CURL_RETRY` | `5` | curl built-in retry count |
-| `PLAYER_CURL_RETRY_DELAY` | `3` | Seconds between curl retries |
-| `PLAYER_CURL_DISABLE_RANGE` | `0` | Set to `1` to disable Range requests (some CDNs) |
-| `PLAYER_MIN_BUFFER_KB` | `256` | Minimum KB on disk before mpv starts (desktop) |
-| `PLAYER_MPV_NO_TERMINAL` | `1` | Set to `0` to show mpv's own terminal output |
-| `PLAYER_STREAM_FALLBACK` | `1` | Set to `0` to disable HTTP fallback if cache is empty |
-| `PLAYER_DISABLE_SEEK_AHEAD` | `0` | Set to `1` to disable curl seek-ahead on resume |
+| Variable                      | Default                            | Description                                                                     |
+| ----------------------------- | ---------------------------------- | ------------------------------------------------------------------------------- |
+| `PLAYER_SECRETS_FILE`         | —                                  | Path to the secrets file (TOML)                                                 |
+| `PLAYER_STORAGE_MODE`         | —                                  | Optional override for storage mode (`local` or `cloud`)                         |
+| `PLAYER_STORAGE_PROVIDER`     | —                                  | Optional override for provider (`arvan`, `aws-s3`, `cloudflare-r2`, `other-s3`) |
+| `PLAYER_S3_ACCESS_KEY_ID`     | —                                  | Optional env-based S3 access key (deprecated)                                   |
+| `PLAYER_S3_SECRET_ACCESS_KEY` | —                                  | Optional env-based S3 secret key (deprecated)                                   |
+| `PLAYER_S3_BUCKET`            | —                                  | Optional env-based S3 bucket (deprecated)                                       |
+| `PLAYER_S3_ENDPOINT_URL`      | —                                  | Optional env-based S3 endpoint (deprecated)                                     |
+| `PLAYER_S3_REGION`            | —                                  | Optional env-based S3 region (deprecated)                                       |
+| `PLAYER_CONFIG_DIR`           | `<project>/.mpv-web-player`        | Override config/progress directory                                              |
+| `PLAYER_TERMUX_VIDEO_DIR`     | `/storage/emulated/0/player-cache` | Override video cache dir on Termux                                              |
+| `PLAYER_CURL_CONNECT_TIMEOUT` | `20`                               | curl connect timeout in seconds                                                 |
+| `PLAYER_CURL_RETRY`           | `5`                                | curl built-in retry count                                                       |
+| `PLAYER_CURL_RETRY_DELAY`     | `3`                                | Seconds between curl retries                                                    |
+| `PLAYER_CURL_DISABLE_RANGE`   | `0`                                | Set to `1` to disable Range requests (some CDNs)                                |
+| `PLAYER_MIN_BUFFER_KB`        | `256`                              | Minimum KB on disk before mpv starts (desktop)                                  |
+| `PLAYER_MPV_NO_TERMINAL`      | `1`                                | Set to `0` to show mpv's own terminal output                                    |
+| `PLAYER_STREAM_FALLBACK`      | `1`                                | Set to `0` to disable HTTP fallback if cache is empty                           |
+| `PLAYER_DISABLE_SEEK_AHEAD`   | `0`                                | Set to `1` to disable curl seek-ahead on resume                                 |
+
+Legacy Arvan environment variables (`PLAYER_ARVAN_ACCESS_KEY`, `PLAYER_ARVAN_SECRET_KEY`, `PLAYER_ARVAN_BUCKET`, `PLAYER_ARVAN_REGION`, `PLAYER_ARVAN_ENDPOINT_URL`) still work for backward compatibility, but the secrets file is the recommended approach.
 
 ## Import/Export
 
@@ -220,8 +307,8 @@ The series-project JSON format is an array of objects, each with:
 Use TUI `i` / `x` to import and export, or CLI:
 
 ```bash
-npx tsx player.ts import /path/to/file.json
-npx tsx player.ts export
+npx tsx src/player.ts import /path/to/file.json
+npx tsx src/player.ts export
 ```
 
 Use TUI `u` to deduplicate a series JSON file (removes entries with duplicate IDs, keeping the one further ahead).

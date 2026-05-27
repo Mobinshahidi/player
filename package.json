@@ -4,17 +4,21 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "player": "tsx player.ts",
-    "tui": "tsx tui.ts",
-    "tui-termux": "tsx tui-termux.ts"
+    "player": "tsx src/player.ts",
+    "tui": "tsx src/tui.ts",
+    "tui-termux": "tsx tui-termux.ts",
+    "test": "node --loader tsx --test"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.883.0",
+    "@iarna/toml": "^2.2.5",
     "blessed": "^0.1.81",
     "ink": "^4.4.1",
     "react": "^18.3.1"
   },
   "devDependencies": {
     "@types/blessed": "^0.1.25",
+    "@types/node": "^22.13.5",
     "@types/react": "^18.3.1",
     "tsx": "^4.19.4",
     "typescript": "^5.8.3"

@@ -5,6 +5,7 @@
 
 import blessed from "blessed";
 import { execSync, spawn } from "child_process";
+import * as readline from "readline";
 import {
   appendFileSync,
   existsSync,
@@ -33,7 +34,10 @@ import {
   importFromFile,
   applyImport,
   exportToFile,
-  ARVAN_SYNC,
+  CLOUD_SYNC,
+  getStorageBootstrapState,
+  getPreferredSecretsPath,
+  setStorageModeChoice,
   IS_TERMUX,
   CONFIG_DIR,
   deleteVideoCache,
@@ -119,6 +123,45 @@ function logToFile(msg: string): void {
     ensureLogDir();
     appendFileSync(LOG_PATH, `${new Date().toISOString()} ${msg}\n`);
   } catch {}
+}
+
+function promptOnce(question: string): Promise<string> {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    rl.question(question, (ans) => {
+      rl.close();
+      resolve(ans.trim());
+    });
+  });
+}
+
+async function maybeRunStorageSetupTui(): Promise<void> {
+  const bootstrap = getStorageBootstrapState();
+  if (!bootstrap.needsPrompt) return;
+  console.log(
+    "\nDo you want to store your data locally only, or sync to a cloud provider (Arvan, AWS S3, Cloudflare R2, etc.)?",
+  );
+  const ans = (await promptOnce("Choose [local/cloud]: ")).toLowerCase();
+  const mode = ans.startsWith("c") ? "cloud" : "local";
+  if (mode === "local") {
+    setStorageModeChoice("local");
+    console.log("✓ Using local-only storage.");
+    return;
+  }
+  setStorageModeChoice("cloud");
+  console.log(
+    "\nCloud sync selected. You can keep using local mode until the secrets file is present.",
+  );
+  console.log("Steps to enable cloud sync:");
+  console.log("  1) Create an account and a bucket with your provider.");
+  console.log("  2) Generate an access key and secret key.");
+  console.log(
+    `  3) Create a secrets file at: ${getPreferredSecretsPath()}`,
+  );
+  console.log("  4) Restart the app.\n");
 }
 
 function sortEpisodeUrls(urls: string[]): string[] {
@@ -257,12 +300,12 @@ function showCacheHelp(): void {
   ];
   box.setContent(lines.join("\n"));
   const close = () => { box.destroy(); modalOpen = false; listBox.focus(); screen.render(); };
-  setImmediate(() => {
+  setTimeout(() => {
     screen.once("keypress", close);
     box.key(["escape", "q", "enter", "space"], close);
     box.focus();
     screen.render();
-  });
+  }, 0);
 }
 
 const tuiVlcPrompts: VlcPrompts = {
@@ -390,7 +433,7 @@ function selectedKey(): string | null {
 
 function updateHeader(): void {
   let sync = "";
-  if (ARVAN_SYNC) {
+  if (CLOUD_SYNC) {
     const s = syncStatus as string;
     const sym = s === "ok" ? "✓" : s === "syncing" ? "↻" : s === "error" ? "✗" : "·";
     const col = s === "ok" ? "#5faf5f" : s === "error" ? "#cf6679" : HINT;
@@ -489,7 +532,7 @@ function forceRefresh(): void {
   updateHeader();
   refreshList();
   screen.render();
-  setImmediate(() => screen.render());
+  setTimeout(() => screen.render(), 0);
 }
 
 function formatConsoleArgs(args: unknown[]): string {
@@ -1476,7 +1519,12 @@ async function showExportModal(): Promise<void> {
 // ─── SYNC ─────────────────────────────────────────────────────────────────────
 
 function forceSync(): void {
-  if (!ARVAN_SYNC) { showError("Sync not configured (set PLAYER_ARVAN_* env vars)"); return; }
+  if (!CLOUD_SYNC) {
+    showError(
+      `Sync not configured (create secrets file at ${getPreferredSecretsPath()})`,
+    );
+    return;
+  }
   schedulePush(true);
   showInfo("Sync triggered");
 }
@@ -1516,12 +1564,12 @@ function showHelp(): void {
   ].join("\n"));
 
   const close = () => { box.destroy(); modalOpen = false; listBox.focus(); screen.render(); };
-  setImmediate(() => {
+  setTimeout(() => {
     screen.once("keypress", close);
     box.key(["escape", "q", "?", "enter", "space"], close);
     box.focus();
     screen.render();
-  });
+  }, 0);
 }
 
 // ─── GUARD ────────────────────────────────────────────────────────────────────
@@ -1700,6 +1748,7 @@ async function main(): Promise<void> {
     const ok = tryDetachToKitty(scriptPath, extraArgs);
     if (ok) process.exit(0);
   }
+  await maybeRunStorageSetupTui();
   // Silence console output during store init (sync logs, TLS warnings, etc.)
   const origLog  = console.log;
   const origWarn = console.warn;

@@ -38,7 +38,9 @@ import {
   VIDEO_DIR,
   CONFIG_DIR,
   CACHE_DIR,
-  ARVAN_SYNC,
+  getStorageBootstrapState,
+  getPreferredSecretsPath,
+  setStorageModeChoice,
   QuitToMenu,
   fuzzyMatch,
   clearEpisodeCache,
@@ -89,6 +91,32 @@ async function promptNumber(
   if (!ans) return defaultVal;
   const n = parseInt(ans, 10);
   return isNaN(n) ? defaultVal : n;
+}
+
+async function maybeRunStorageSetup(): Promise<void> {
+  const bootstrap = getStorageBootstrapState();
+  if (!bootstrap.needsPrompt) return;
+  console.log(
+    "\nDo you want to store your data locally only, or sync to a cloud provider (Arvan, AWS S3, Cloudflare R2, etc.)?",
+  );
+  const ans = (await prompt("Choose [local/cloud]: ")).toLowerCase();
+  const mode = ans.startsWith("c") ? "cloud" : "local";
+  if (mode === "local") {
+    setStorageModeChoice("local");
+    console.log("✓ Using local-only storage.");
+    return;
+  }
+  setStorageModeChoice("cloud");
+  console.log(
+    "\nCloud sync selected. You can keep using local mode until the secrets file is present.",
+  );
+  console.log("Steps to enable cloud sync:");
+  console.log("  1) Create an account and a bucket with your provider.");
+  console.log("  2) Generate an access key and secret key.");
+  console.log(
+    `  3) Create a secrets file at: ${getPreferredSecretsPath()}`,
+  );
+  console.log("  4) Restart the app.");
 }
 
 // VlcPrompts implementation using readline (for the CLI runSession path)
@@ -1285,6 +1313,7 @@ main().catch((e) => {
 
 async function main() {
   const args = process.argv.slice(2);
+  await maybeRunStorageSetup();
   if (args[0] === "list") {
     await initStore();
     listAllProgress();
