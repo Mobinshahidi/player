@@ -42,6 +42,7 @@ import {
   CONFIG_DIR,
   deleteVideoCache,
   isDirectVideoUrl,
+  isYouTubeUrl,
   playWithMpv,
   resolveEpisodes,
   getSeasonUrl,
@@ -682,6 +683,32 @@ async function playSelected(): Promise<void> {
   let playError: string | null = null;
   const playInKitty = shouldPlayInKitty();
   const vlcPrompts = IS_TERMUX ? tuiVlcPrompts : undefined;
+  let isYouTubeVideo = isYouTubeUrl(p.url);
+  
+  // Handle YouTube proxy restart
+  if (isYouTubeVideo && p.overview?.includes("VPN/proxy enabled")) {
+    const restartTui = await confirmDialog(
+      "YouTube video finished. Should we restart TUI with proxy disabled to sync with Arvan?",
+      "Restart"
+    );
+    if (restartTui) {
+      setTuiActive(false);
+      if (IS_TERMUX) {
+        screen.program.showCursor();
+        screen.program.normalBuffer();
+        process.stdout.write("\x1b[2J\x1b[H");
+      } else {
+        (screen as any).leave?.();
+      }
+      // Restart TUI without proxy for next session
+      process.env.PLAYER_YOUTUBE_PROXY = "disabled";
+      setTimeout(() => {
+        require('./tui.js');
+      }, 1000);
+      return;
+    }
+  }
+  
   if (!playInKitty) {
     setTuiActive(false);
     if (IS_TERMUX) {
@@ -976,6 +1003,85 @@ function promptText(title: string, label: string, def = ""): Promise<string | nu
     inp.on("cancel", () => done(null));
     inp.key(["escape", "C-c"], () => done(null));
     box.key(["escape", "C-c"], () => done(null));
+    
+    // Prevent character duplication by tracking last input
+    let lastInputTime = 0;
+    let lastInputChar = '';
+    const INPUT_DEBOUNCE_MS = 50;
+    
+    inp.on("keypress", (ch, key) => {
+      const now = Date.now();
+      
+      // Debounce rapid identical character inputs
+      if (ch && ch.length === 1 && !key.ctrl && !key.meta && !key.shift) {
+        if (lastInputChar === ch && (now - lastInputTime) < INPUT_DEBOUNCE_MS) {
+          // Skip this duplicate character
+          return false;
+        }
+        lastInputChar = ch;
+        lastInputTime = now;
+      }
+    });
+
+    // Add navigation key bindings for text input
+    inp.key(["home"], () => {
+      const input = inp as any;
+      if (input.cursor && typeof input.cursor === 'function') {
+        input.cursor(0, 0);
+      }
+    });
+
+    inp.key(["end"], () => {
+      const input = inp as any;
+      const value = input.getValue?.() || input.value || "";
+      if (input.cursor && typeof input.cursor === 'function') {
+        input.cursor(value.length, 0);
+      }
+    });
+
+    inp.key(["left"], () => {
+      const input = inp as any;
+      const value = input.getValue?.() || input.value || "";
+      const [x, y] = input.cursor ? (Array.isArray(input.cursor) ? input.cursor : [input.cursor, 0]) : [value.length, 0];
+      if (x > 0) {
+        input.cursor(x - 1, y);
+      }
+    });
+
+    inp.key(["right"], () => {
+      const input = inp as any;
+      const value = input.getValue?.() || input.value || "";
+      const [x, y] = input.cursor ? (Array.isArray(input.cursor) ? input.cursor : [input.cursor, 0]) : [value.length, 0];
+      if (x < value.length) {
+        input.cursor(x + 1, y);
+      }
+    });
+
+    inp.key(["ctrl+left"], () => {
+      const input = inp as any;
+      const value = input.getValue?.() || input.value || "";
+      const [x, y] = input.cursor ? (Array.isArray(input.cursor) ? input.cursor : [input.cursor, 0]) : [value.length, 0];
+      
+      // Move to previous word
+      let newX = x > 0 ? x - 1 : 0;
+      while (newX > 0 && value[newX - 1] !== ' ' && value[newX - 1] !== '\t') {
+        newX--;
+      }
+      input.cursor(Math.max(0, newX), y);
+    });
+
+    inp.key(["ctrl+right"], () => {
+      const input = inp as any;
+      const value = input.getValue?.() || input.value || "";
+      const [x, y] = input.cursor ? (Array.isArray(input.cursor) ? input.cursor : [input.cursor, 0]) : [value.length, 0];
+      
+      // Move to next word
+      let newX = x < value.length ? x + 1 : value.length;
+      while (newX < value.length && value[newX] !== ' ' && value[newX] !== '\t') {
+        newX++;
+      }
+      input.cursor(Math.min(value.length, newX), y);
+    });
 
     const pathPrompt = /path/i.test(label);
     if (pathPrompt) {
@@ -1087,20 +1193,45 @@ async function showNewEntryModal(): Promise<void> {
   if (!url) return;
   const urls = parseUrlInput(url);
   if (urls.length === 0) { showError("No URL provided"); return; }
-  const suggested = sanitiseKey(urls[0]);
-  const name = await promptText("New Entry", "Name:", suggested);
+  
+  // Handle YouTube URL with VPN/proxy check
+  const firstUrl = urls[0];
+  let useProxy = false;
+  
+  if (isYouTubeUrl(firstUrl)) {
+    const proxyRequired = await confirmDialog(
+      "YouTube URL detected: Do you have VPN/proxy enabled? (Required for access)",
+      "Yes"
+    );
+    if (!proxyRequired) {
+      const proxyWarning = await confirmDialog(
+        "Warning: YouTube videos may not play properly without VPN/proxy.\nContinue anyway?",
+        "Continue"
+      );
+      if (!proxyWarning) return;
+    }
+    useProxy = proxyRequired;
+  }
+  
+  // Don't autofill URL as name - user must enter name manually
+  const name = await promptText("New Entry", "Name:");
   if (name === null) return;
-  const key = (sanitiseKey(name) || suggested).trim();
+  const key = (sanitiseKey(name) || name || "unnamed").trim();
   if (!key) { showError("Could not determine entry name"); return; }
   if (store[key]) {
     const ok = await confirmDialog(`"${key}" already exists. Overwrite?`, "Overwrite");
     if (!ok) return;
   }
-  const firstUrl = urls[0];
+  
   const p: SeriesProgress = {
-    url: firstUrl, season: 1, episode: 0, timestamp: 0,
+    url: firstUrl, 
+    season: 1, 
+    episode: 0, 
+    timestamp: 0,
     isMovie: urls.length > 1 ? false : isDirectVideoUrl(firstUrl),
     manualUrls: urls.length > 1 ? urls : undefined,
+    // Store proxy preference for YouTube URLs
+    ...(useProxy && { overview: "YouTube - VPN/proxy enabled" })
   };
   saveProgress(key, p);
   schedulePush();
@@ -1738,7 +1869,9 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const wantsDetach = args.includes("--detach");
   const isDetached = args.includes("--detached") || process.env.PLAYER_TUI_DETACHED === "1";
-  if (!IS_TERMUX && hasKitty()) {
+  
+  // Only enable kitty mode if explicitly requested for detachment
+  if (wantsDetach && !isDetached && !IS_TERMUX && hasKitty()) {
     process.env.PLAYER_PLAY_IN_KITTY = "1";
     process.env.PLAYER_MPV_NO_TERMINAL = "1";
   }

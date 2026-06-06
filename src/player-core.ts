@@ -1119,10 +1119,20 @@ export function playWithMpvDesktop(
       fileBytesPerVideoSec = 0,
       cacheBytes = alreadyBytes,
       cacheState: CacheStatus["state"] = "buffering";
+    const userAgent = isYouTubeUrl(episodeUrl) 
+      ? "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+      : "Mozilla/5.0";
+    
+    const connectTimeout = isYouTubeUrl(episodeUrl) 
+      ? Math.max(CURL_CONNECT_TIMEOUT, 45) // Longer timeout for YouTube
+      : CURL_CONNECT_TIMEOUT;
+    
     const cm = new CacheManager({
-      connectTimeoutSec: CURL_CONNECT_TIMEOUT,
-      userAgent: "Mozilla/5.0",
+      connectTimeoutSec: connectTimeout,
+      userAgent: userAgent,
       disableRange: CURL_DISABLE_RANGE,
+      baseRetryDelayMs: isYouTubeUrl(episodeUrl) ? 3000 : 2000, // Longer initial delay for YouTube
+      maxRetryDelayMs: isYouTubeUrl(episodeUrl) ? 120000 : 60000, // Longer max delay for YouTube
     });
     cm.on("progress", (bytes: number, total: number, slotIndex: number) => {
       if (slotIndex !== 0) return;
@@ -1602,6 +1612,47 @@ export function isDirectVideoUrl(url: string): boolean {
     );
   } catch {
     return false;
+  }
+}
+
+export function isYouTubeUrl(url: string): boolean {
+  try {
+    const hostname = new URL(url).hostname;
+    return hostname === 'youtube.com' || 
+           hostname === 'www.youtube.com' || 
+           hostname === 'youtu.be' ||
+           hostname.endsWith('.youtube.com');
+  } catch {
+    return false;
+  }
+}
+
+export function extractYouTubeVideoId(url: string): string | null {
+  try {
+    const urlObj = new URL(url);
+    
+    // Handle youtu.be URLs (short form)
+    if (urlObj.hostname === 'youtu.be') {
+      return urlObj.pathname.slice(1); // Remove leading slash
+    }
+    
+    // Handle youtube.com URLs
+    if (urlObj.hostname === 'youtube.com' || urlObj.hostname === 'www.youtube.com') {
+      // Watch URL format
+      if (urlObj.pathname === '/watch') {
+        const params = new URLSearchParams(urlObj.search);
+        return params.get('v');
+      }
+      
+      // Embedded video format
+      if (urlObj.pathname.startsWith('/embed/')) {
+        return urlObj.pathname.slice(7);
+      }
+    }
+    
+    return null;
+  } catch {
+    return null;
   }
 }
 
