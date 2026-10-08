@@ -7,7 +7,11 @@
     "player": "tsx src/player.ts",
     "tui": "tsx src/tui.ts",
     "tui-termux": "tsx tui-termux.ts",
-    "test": "node --loader tsx --test"
+    "gui": "tauri dev",
+    "gui:server": "node --import tsx src/gui-server.ts",
+    "gui:browser": "node --import tsx src/gui-browser.ts",
+    "gui:build": "tauri build",
+    "test": "node --import tsx --test"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.883.0",
@@ -17,10 +21,11 @@
     "react": "^18.3.1"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.0.0",
     "@types/blessed": "^0.1.25",
     "@types/node": "^22.13.5",
     "@types/react": "^18.3.1",
-    "tsx": "^4.19.4",
+    "tsx": "^4.23.12",
     "typescript": "^5.8.3"
   }
 }

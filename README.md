@@ -4,10 +4,13 @@ Terminal-first media player with a fast TUI, a CLI mode, local progress tracking
 
 ## Features
 
+- Simple desktop GUI (Tauri) for non-technical users — paste a series link, pick version/quality, watch (local-only)
 - TUI with keyboard-first navigation and search
 - CLI mode for quick play and management
 - Auto resume per series/episode or movie
 - Series directory scraping with episode ordering
+- Series page scraping with automatic new episode detection (`C` key)
+- Per-episode watch position tracking (independent of series-level timestamp)
 - Manual URL lists (paste multiple episode URLs)
 - Local caching and background prefetch of next episode
 - Download resume with exponential-backoff retry on partial transfers
@@ -53,11 +56,102 @@ npm install -g tsx
 npx tsx src/tui.ts
 ```
 
-Detach into a new Kitty window:
+By default the TUI detaches into a new Kitty window (when Kitty is installed). To keep it in the current terminal:
 
 ```bash
-npx tsx src/tui.ts --detach
+npx tsx src/tui.ts --no-detach
 ```
+
+### Text input keys (prompts/modals)
+
+| Key             | Action                        |
+| --------------- | ----------------------------- |
+| `← / →`         | Move cursor one character     |
+| `Ctrl+← / →`    | Jump word by word             |
+| `Home` / `End`  | Start / end of line           |
+| `Ctrl+U`        | Clear the whole line          |
+| `Ctrl+K`        | Delete from cursor to end     |
+| `Ctrl+W`        | Delete word before cursor     |
+| `Enter` / `Esc` | Confirm / cancel              |
+
+## Run (GUI) — Desktop
+
+A simple, clean desktop window for non-technical users: paste a series link,
+pick the version and quality, and watch. Playback still runs in `mpv`; the
+window is the library/control panel.
+
+**Local-only:** the GUI never uses cloud sync, even if a secrets file or
+`storage.json` is present. It shares the same local progress store, settings,
+and video cache as the TUI.
+
+### What it does
+
+- Paste a series page link (e.g. `https://www.myf2m.org/series/mobland/`).
+- If the page was not scraped before, it scrapes it; otherwise the cached
+  result (1 h TTL) is used. A **Refresh** button forces a re-scrape.
+- Asks which **version** (Dubbed / Hard sub) and which **quality**
+  (**720p by default**).
+- Shows how many episodes exist **this season** and **in the series**, plus
+  the scraped **description and poster** in the right sidebar.
+- Plays episodes back-to-back (the next episode is prefetched), and when a
+  season ends it asks whether to **delete that season's cached episodes**.
+- The **hardsub export** feature (burn-in via `stoh`) is intentionally not
+  part of the GUI.
+
+### Build dependencies
+
+Tauri uses the system WebKitGTK. One-time setup — pick your distro:
+
+**Fedora**
+
+```bash
+./scripts/setup-fedora.sh
+# equivalent to:
+#   sudo dnf install -y nodejs npm mpv curl wget file \
+#     webkit2gtk4.1-devel javascriptcoregtk4.1-devel libsoup3-devel \
+#     openssl-devel librsvg2-devel libappindicator-gtk3-devel \
+#     gcc gcc-c++ make pkgconf-pkg-config rust cargo
+```
+
+**Arch Linux**
+
+```bash
+./scripts/setup-arch.sh
+# equivalent to:
+#   sudo pacman -S --needed nodejs npm mpv curl \
+#     rust webkit2gtk-4.1 base-devel \
+#     libappindicator-gtk3 librsvg patchelf openssl
+```
+
+**Other distros:** install WebKitGTK **4.1** development headers plus a C
+toolchain (`gcc`/`cc`, `make`, `pkg-config`), `librsvg2`, and `openssl`
+headers. Tauri v2 requires the 4.1 API (not 4.0).
+
+### Run
+
+```bash
+npm install
+npm run gui          # builds the Rust shell once, then opens the window
+```
+
+The first run compiles the Rust shell (a few minutes); later runs start in
+about a second. A desktop entry is provided at `player-gui.desktop`
+(adjust the paths, then copy to `~/.local/share/applications/`).
+
+### Troubleshooting (Linux)
+
+- **Blank or white window** — WebKitGTK compositing issues on Wayland/NVIDIA.
+  The app already sets `WEBKIT_DISABLE_COMPOSITING_MODE=1` and
+  `WEBKIT_DISABLE_DMABUF_RENDERER=1` by default; to override, export either
+  variable yourself before launching.
+- **`webkit2gtk-4.1 not found`** — install the development package
+  (`webkit2gtk4.1-devel` on Fedora, `webkit2gtk-4.1` on Arch) and re-run
+  `npm run gui`.
+- **No Rust toolchain** — use the browser fallback instead:
+
+  ```bash
+  npm run gui:browser  # starts the server and opens it in your browser
+  ```
 
 ## Run (CLI)
 
@@ -151,6 +245,7 @@ export PLAYER_TERMUX_VIDEO_DIR=/storage/emulated/0/MyFolder
 | `<project>/.mpv-web-player/playlists.json` | Playlists (syncable)                 |
 | `<project>/.mpv-player-secrets`            | Optional secrets file for cloud sync |
 | `<project>/.mpv-web-player/cache/`         | Episode list cache (1 h TTL)         |
+| `<project>/.mpv-web-player/series-info-cache/` | Scraped series page info for the GUI (1 h TTL) |
 | `<project>/video-cache/`                   | Downloaded video files (desktop)     |
 | `/storage/emulated/0/player-cache/`        | Downloaded video files (Termux)      |
 
@@ -319,11 +414,16 @@ Use TUI `u` to deduplicate a series JSON file (removes entries with duplicate ID
 
 Each entry in the progress store contains:
 
-- `url` — series directory URL or direct episode/movie URL
+- `url` — primary playback URL (direct episode/movie URL, or first scraped episode)
+- `sourceUrl` — optional series page URL (for auto-detecting new episodes)
 - `season`, `episode` — 0-based episode index within the season
-- `timestamp` — playback position in seconds
+- `timestamp` — playback position in seconds (legacy, fallback)
+- `episodeTimestamps` — per-episode watch positions (keyed by SxxExx or filename)
 - `finished` — true when the series or movie is fully watched
 - `manualUrls` — optional ordered list of episode URLs for manual sources
+- `source` — scrape metadata (`kind`, `variant`, `quality`)
+- `knownEpisodes` — list of all known episode URLs (for new-episode detection)
+- `newEpisodeCount` — count of newly detected episodes since last view
 
 Progress is saved after every key event: episode start, episode end, position poll during playback, and on exit.
 

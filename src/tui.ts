@@ -48,9 +48,20 @@ import {
   getSeasonUrl,
   splitUrlBlock,
   extractEpisodeNumber,
+  getEpisodeTimestamp,
+  setEpisodePosition,
+  seriesHasMultipleSeasons,
+  mergeEpisodeTimestamps,
+  ensureSeriesSource,
+  refreshSeriesSource,
+  scrapeSeriesSource,
+  resolveSeriesPage,
+  isSeriesPageHtml,
+  episodeKeyFromUrl,
 } from "./player-core.js";
 import type {
   SeriesProgress,
+  ScrapeResult,
   ImportPreview,
   SeriesProjectEntry,
   VlcPrompts,
@@ -166,7 +177,16 @@ async function maybeRunStorageSetupTui(): Promise<void> {
 }
 
 function sortEpisodeUrls(urls: string[]): string[] {
-  return [...urls].sort((a, b) => extractEpisodeNumber(a) - extractEpisodeNumber(b));
+  return [...urls].sort((a, b) => {
+    const ka = episodeKeyFromUrl(a);
+    const kb = episodeKeyFromUrl(b);
+    if (ka && kb) {
+      const [sa, ea] = ka.split(":").map(Number);
+      const [sb, eb] = kb.split(":").map(Number);
+      return sa! - sb! || ea! - eb!;
+    }
+    return extractEpisodeNumber(a) - extractEpisodeNumber(b);
+  });
 }
 
 async function offerHardsubTui(localPath: string): Promise<void> {
@@ -373,8 +393,11 @@ function formatListItem(key: string | null): string {
   const maxName = layoutMode === "narrow" ? 20 : 26;
   const name = prettifyKey(key).padEnd(maxName).slice(0, maxName);
   const prog = renderProgress(p);
+  const badge = p.newEpisodeCount && p.newEpisodeCount > 0
+    ? ` {${ACCENT}-fg}+${p.newEpisodeCount} new{/}`
+    : "";
   const spacer = layoutMode === "narrow" ? " " : "  ";
-  const text = `  ${name}${spacer}${prog}`;
+  const text = `  ${name}${spacer}${prog}${badge}`;
   if (p.finished) return `{${FINISHED_FG}-fg}${text}{/}`;
   if (p.episode > 0 || p.timestamp > 0) return `{${WATCHING_FG}-fg}${text}{/}`;
   return `{${NEUTRAL}-fg}${text}{/}`;
@@ -680,6 +703,10 @@ async function playSelected(): Promise<void> {
   const p = store[key];
   if (!p) return;
 
+  if (p.newEpisodeCount && p.newEpisodeCount > 0) {
+    saveProgress(key, { ...p, newEpisodeCount: 0 });
+  }
+
   let playError: string | null = null;
   const playInKitty = shouldPlayInKitty();
   const vlcPrompts = IS_TERMUX ? tuiVlcPrompts : undefined;
@@ -724,15 +751,12 @@ async function playSelected(): Promise<void> {
   try {
     if ((p.isMovie || isDirectVideoUrl(p.url)) && !p.manualUrls?.length) {
       if (playInKitty) setCacheStatusLine("Cache: starting");
+      const startTime = getEpisodeTimestamp(p, p.url, p.season, p.episode);
       const result = await playWithMpv(
-        MPV, p.url, p.timestamp,
+        MPV, p.url, startTime,
         (time) => {
           const cur = store[key] ?? p;
-          saveProgress(key, {
-            ...cur,
-            timestamp: time,
-            cacheOffset: cur.cacheOffset ?? p.cacheOffset,
-          });
+          saveProgress(key, setEpisodePosition(cur, p.url, p.season, p.episode, time));
         },
         key,
         vlcPrompts,
@@ -745,12 +769,7 @@ async function playSelected(): Promise<void> {
       );
       if (result.finalPosition) {
         const cur = store[key] ?? p;
-        saveProgress(key, {
-          ...cur,
-          timestamp: result.finalPosition.time,
-          cacheOffset:
-            result.cacheOffset > 0 ? result.cacheOffset : cur.cacheOffset,
-        });
+        saveProgress(key, setEpisodePosition(cur, p.url, p.season, p.episode, result.finalPosition.time));
       }
       await offerHardsubTui(result.localPath);
       if (await confirmDialog("Delete local cache file?", "Delete")) {
@@ -760,6 +779,11 @@ async function playSelected(): Promise<void> {
         await promptAfterFinishedTui(key, store[key] ?? p);
       }
     } else {
+      if (!p.manualUrls?.length) {
+        showInfo("Fetching series episodes...");
+        await ensureSeriesSource(p);
+        if (p.manualUrls?.length) saveProgress(key, p);
+      }
       const seasonRaw = await promptText(
         "Start",
         "Season (Enter = keep):",
@@ -783,7 +807,8 @@ async function playSelected(): Promise<void> {
       }
 
       const canIterateSeasons =
-        !isDirectVideoUrl(p.url) && getSeasonUrl(p.url, 1) !== getSeasonUrl(p.url, 2);
+        (!isDirectVideoUrl(p.url) && getSeasonUrl(p.url, 1) !== getSeasonUrl(p.url, 2)) ||
+        seriesHasMultipleSeasons(p);
 
       while (true) {
         let episodes: string[] = [];
@@ -821,8 +846,7 @@ async function playSelected(): Promise<void> {
           const epUrl = episodes[episode] ?? p.url;
           const label = key;
           const cur = store[key] ?? p;
-          const startTime =
-            cur.season === season && cur.episode === episode ? cur.timestamp : 0;
+          const startTime = getEpisodeTimestamp(cur, epUrl, season, episode);
           const cacheOffsetHint =
             cur.season === season && cur.episode === episode
               ? cur.cacheOffset ?? 0
@@ -832,16 +856,7 @@ async function playSelected(): Promise<void> {
             MPV, epUrl, startTime,
             (time) => saveProgress(
               key,
-              {
-                ...(store[key] ?? p),
-                season,
-                episode,
-                timestamp: time,
-                cacheOffset:
-                  cur.season === season && cur.episode === episode
-                    ? cur.cacheOffset
-                    : 0,
-              },
+              setEpisodePosition(store[key] ?? p, epUrl, season, episode, time),
             ),
             label,
             vlcPrompts,
@@ -858,16 +873,7 @@ async function playSelected(): Promise<void> {
           if (result.finalPosition) {
             saveProgress(
               key,
-              {
-                ...(store[key] ?? p),
-                season,
-                episode,
-                timestamp: result.finalPosition.time,
-                cacheOffset:
-                  result.cacheOffset > 0
-                    ? result.cacheOffset
-                    : (store[key] ?? p).cacheOffset,
-              },
+              setEpisodePosition(store[key] ?? p, epUrl, season, episode, result.finalPosition.time),
             );
           }
           await offerHardsubTui(result.localPath);
@@ -896,7 +902,7 @@ async function playSelected(): Promise<void> {
 
           episode += 1;
           if (episode >= episodes.length) {
-            if (canIterateSeasons && !p.manualUrls?.length) {
+            if (canIterateSeasons && (!p.manualUrls?.length || seriesHasMultipleSeasons(p))) {
               const next = await confirmDialog(`Season ${season} done. Continue to Season ${season + 1}?`, "Continue");
               if (!next) {
                 await promptAfterFinishedTui(key, store[key] ?? p);
@@ -977,6 +983,9 @@ function closeModal(box: blessed.Widgets.BoxElement): void {
 
 // ─── TEXT PROMPT ──────────────────────────────────────────────────────────────
 
+// blessed's textbox cannot edit mid-line (its textarea appends at the end and
+// has no cursor position), so this is a self-contained line editor driven by
+// screen-level keypress events — the same pattern showSearchModal uses.
 function promptText(title: string, label: string, def = ""): Promise<string | null> {
   return new Promise((resolve) => {
     modalOpen = true;
@@ -990,147 +999,166 @@ function promptText(title: string, label: string, def = ""): Promise<string | nu
     blessed.text({ parent: box, top: 1, left: 2,
       content: label, tags: true, style: { bg: BG, fg: NEUTRAL } });
 
-    const inp = blessed.textbox({ parent: box, top: 3, left: 2, right: 2, height: 1,
-      inputOnFocus: true, value: def, keys: true, vi: true, mouse: true, cursors: true,
-      style: { bg: "#2a2a29", fg: NEUTRAL, focus: { bg: "#383836" } } });
+    const inp = blessed.box({ parent: box, top: 3, left: 2, right: 2, height: 1,
+      tags: true, style: { bg: "#2a2a29", fg: NEUTRAL } });
 
     blessed.text({ parent: box, bottom: 1, left: 2,
-      content: `{${HINT}-fg}Enter: confirm  Esc: cancel{/}`,
+      content: `{${HINT}-fg}Enter: ok  Esc: cancel  C-u: clear  C-←/→: word  Home/End{/}`,
       tags: true, style: { bg: BG } });
 
-    const done = (v: string | null) => { closeModal(box); resolve(v); };
-    inp.on("submit", (v: string) => done(v.trim()));
-    inp.on("cancel", () => done(null));
-    inp.key(["escape", "C-c"], () => done(null));
-    box.key(["escape", "C-c"], () => done(null));
-    
-    // Prevent character duplication by tracking last input
-    let lastInputTime = 0;
-    let lastInputChar = '';
-    const INPUT_DEBOUNCE_MS = 50;
-    
-    inp.on("keypress", (ch, key) => {
-      const now = Date.now();
-      
-      // Debounce rapid identical character inputs
-      if (ch && ch.length === 1 && !key.ctrl && !key.meta && !key.shift) {
-        if (lastInputChar === ch && (now - lastInputTime) < INPUT_DEBOUNCE_MS) {
-          // Skip this duplicate character
-          return false;
+    let value = def;
+    let pos = value.length;
+    let lastPrintableAt = 0;
+
+    const esc = (s: string) =>
+      s.replace(/\{/g, "{open}").replace(/\}/g, "{close}");
+
+    const render = () => {
+      const w = Math.max(4, typeof inp.width === "number" ? inp.width : 40);
+      // horizontal scroll window that keeps the cursor visible
+      let start = 0;
+      if (pos >= w - 1) start = pos - w + 2;
+      const view = value.slice(start, start + w - 1);
+      const rel = pos - start;
+      const at = view.slice(rel, rel + 1);
+      inp.setContent(
+        `${esc(view.slice(0, rel))}{inverse}${at ? esc(at) : " "}{/inverse}${esc(view.slice(rel + 1))}`,
+      );
+      screen.render();
+    };
+
+    const insert = (s: string) => {
+      value = value.slice(0, pos) + s + value.slice(pos);
+      pos += s.length;
+      render();
+    };
+
+    // URLs have no spaces, so treat separators as word boundaries too
+    const BOUNDARY = /[\s/=&?._-]/;
+    const wordLeft = () => {
+      let i = pos;
+      while (i > 0 && BOUNDARY.test(value[i - 1]!)) i--;
+      while (i > 0 && !BOUNDARY.test(value[i - 1]!)) i--;
+      pos = i;
+    };
+    const wordRight = () => {
+      let i = pos;
+      while (i < value.length && BOUNDARY.test(value[i]!)) i++;
+      while (i < value.length && !BOUNDARY.test(value[i]!)) i++;
+      pos = i;
+    };
+
+    const pathPrompt = /path|folder/i.test(label);
+    const completePath = () => {
+      const trimmed = value.trim();
+      if (!trimmed) return;
+      const expanded = trimmed.startsWith("~")
+        ? join(homedir(), trimmed.slice(1))
+        : trimmed;
+      const lastSlash = expanded.lastIndexOf("/");
+      const baseDir = lastSlash >= 0 ? expanded.slice(0, lastSlash + 1) : "";
+      const prefix = lastSlash >= 0 ? expanded.slice(lastSlash + 1) : expanded;
+      const dirPath = baseDir
+        ? (baseDir.startsWith("/") ? baseDir : join(appRootDir(), baseDir))
+        : appRootDir();
+
+      let entries: string[] = [];
+      try {
+        entries = readdirSync(dirPath)
+          .filter((n) => n.startsWith(prefix))
+          .sort((a, b) => a.localeCompare(b));
+      } catch {
+        return;
+      }
+      if (entries.length === 0) return;
+
+      const pick = entries[0]!;
+      let suffix = "";
+      try {
+        const st = statSync(join(dirPath, pick));
+        if (st.isDirectory()) suffix = "/";
+      } catch {}
+
+      const rawBase = trimmed.startsWith("~")
+        ? "~" + (baseDir.replace(homedir(), "") || "/")
+        : baseDir;
+      value = (rawBase || "") + pick + suffix;
+      pos = value.length;
+      render();
+      if (entries.length > 1) {
+        showInfo(`Matches: ${entries.slice(0, 6).join(", ")}${entries.length > 6 ? " …" : ""}`);
+      }
+    };
+
+    const done = (v: string | null) => {
+      screen.removeListener("keypress", onKey);
+      ignoreEnterUntil = Date.now() + 300;
+      closeModal(box);
+      resolve(v);
+    };
+
+    const onKey = (ch: string | undefined, key: any) => {
+      if (!key) return;
+      const name: string = key.name ?? "";
+      if (name === "return") return; // program re-emits '\r' as a second 'enter' event
+
+      if (name === "escape" || (key.ctrl && name === "c")) return done(null);
+      if (name === "enter") {
+        // a newline mid-burst is a pasted line break, not a submit — keep it
+        // as a separator so multi-URL pastes stay in this field
+        if (Date.now() - lastPrintableAt < 15) return insert(" ");
+        return done(value.trim());
+      }
+
+      if (key.ctrl) {
+        switch (name) {
+          case "u": value = ""; pos = 0; break;          // clear whole line
+          case "k": value = value.slice(0, pos); break;  // kill to end
+          case "w": {                                     // delete word left
+            const from = pos;
+            wordLeft();
+            value = value.slice(0, pos) + value.slice(from);
+            break;
+          }
+          case "a": pos = 0; break;
+          case "e": pos = value.length; break;
+          case "left": wordLeft(); break;
+          case "right": wordRight(); break;
+          default: return;
         }
-        lastInputChar = ch;
-        lastInputTime = now;
+        return render();
       }
-    });
-
-    // Add navigation key bindings for text input
-    inp.key(["home"], () => {
-      const input = inp as any;
-      if (input.cursor && typeof input.cursor === 'function') {
-        input.cursor(0, 0);
+      if (key.meta) {
+        if (name === "left" || name === "b") { wordLeft(); return render(); }
+        if (name === "right" || name === "f") { wordRight(); return render(); }
+        return;
       }
-    });
 
-    inp.key(["end"], () => {
-      const input = inp as any;
-      const value = input.getValue?.() || input.value || "";
-      if (input.cursor && typeof input.cursor === 'function') {
-        input.cursor(value.length, 0);
-      }
-    });
-
-    inp.key(["left"], () => {
-      const input = inp as any;
-      const value = input.getValue?.() || input.value || "";
-      const [x, y] = input.cursor ? (Array.isArray(input.cursor) ? input.cursor : [input.cursor, 0]) : [value.length, 0];
-      if (x > 0) {
-        input.cursor(x - 1, y);
-      }
-    });
-
-    inp.key(["right"], () => {
-      const input = inp as any;
-      const value = input.getValue?.() || input.value || "";
-      const [x, y] = input.cursor ? (Array.isArray(input.cursor) ? input.cursor : [input.cursor, 0]) : [value.length, 0];
-      if (x < value.length) {
-        input.cursor(x + 1, y);
-      }
-    });
-
-    inp.key(["ctrl+left"], () => {
-      const input = inp as any;
-      const value = input.getValue?.() || input.value || "";
-      const [x, y] = input.cursor ? (Array.isArray(input.cursor) ? input.cursor : [input.cursor, 0]) : [value.length, 0];
-      
-      // Move to previous word
-      let newX = x > 0 ? x - 1 : 0;
-      while (newX > 0 && value[newX - 1] !== ' ' && value[newX - 1] !== '\t') {
-        newX--;
-      }
-      input.cursor(Math.max(0, newX), y);
-    });
-
-    inp.key(["ctrl+right"], () => {
-      const input = inp as any;
-      const value = input.getValue?.() || input.value || "";
-      const [x, y] = input.cursor ? (Array.isArray(input.cursor) ? input.cursor : [input.cursor, 0]) : [value.length, 0];
-      
-      // Move to next word
-      let newX = x < value.length ? x + 1 : value.length;
-      while (newX < value.length && value[newX] !== ' ' && value[newX] !== '\t') {
-        newX++;
-      }
-      input.cursor(Math.min(value.length, newX), y);
-    });
-
-    const pathPrompt = /path/i.test(label);
-    if (pathPrompt) {
-      inp.key(["tab"], () => {
-        const raw = ((inp as any).getValue?.() ?? (inp as any).value ?? "") as string;
-        const trimmed = raw.trim();
-        if (!trimmed) return;
-
-        const expanded = trimmed.startsWith("~")
-          ? join(homedir(), trimmed.slice(1))
-          : trimmed;
-        const lastSlash = expanded.lastIndexOf("/");
-        const baseDir = lastSlash >= 0 ? expanded.slice(0, lastSlash + 1) : "";
-        const prefix = lastSlash >= 0 ? expanded.slice(lastSlash + 1) : expanded;
-        const dirPath = baseDir
-          ? (baseDir.startsWith("/") ? baseDir : join(appRootDir(), baseDir))
-          : appRootDir();
-
-        let entries: string[] = [];
-        try {
-          entries = readdirSync(dirPath)
-            .filter((n) => n.startsWith(prefix))
-            .sort((a, b) => a.localeCompare(b));
-        } catch {
+      switch (name) {
+        case "left": if (pos > 0) pos--; return render();
+        case "right": if (pos < value.length) pos++; return render();
+        case "home": pos = 0; return render();
+        case "end": pos = value.length; return render();
+        case "backspace":
+          if (pos > 0) { value = value.slice(0, pos - 1) + value.slice(pos); pos--; }
+          return render();
+        case "delete":
+          if (pos < value.length) value = value.slice(0, pos) + value.slice(pos + 1);
+          return render();
+        case "tab":
+          if (pathPrompt) completePath();
           return;
-        }
-        if (entries.length === 0) return;
+      }
 
-        const pick = entries[0]!;
-        let suffix = "";
-        try {
-          const st = statSync(join(dirPath, pick));
-          if (st.isDirectory()) suffix = "/";
-        } catch {}
+      if (ch && ch >= " " && ch !== "\x7f") {
+        lastPrintableAt = Date.now();
+        insert(ch);
+      }
+    };
 
-        const rawBase = trimmed.startsWith("~")
-          ? "~" + (baseDir.replace(homedir(), "") || "/")
-          : baseDir;
-        const newVal = (rawBase || "") + pick + suffix;
-        (inp as any).setValue?.(newVal);
-        screen.render();
-        if (entries.length > 1) {
-          showInfo(`Matches: ${entries.slice(0, 6).join(", ")}${entries.length > 6 ? " …" : ""}`);
-        }
-      });
-    }
-
-    inp.focus();
-    screen.render();
+    screen.on("keypress", onKey);
+    box.focus();
+    render();
   });
 }
 
@@ -1189,16 +1217,22 @@ function confirmDialog(msg: string, yesLabel = "Confirm"): Promise<boolean> {
 // ─── NEW ENTRY ────────────────────────────────────────────────────────────────
 
 async function showNewEntryModal(): Promise<void> {
-  const url = await promptText("New Entry", "URL:");
-  if (!url) return;
-  const urls = parseUrlInput(url);
-  if (urls.length === 0) { showError("No URL provided"); return; }
-  
-  // Handle YouTube URL with VPN/proxy check
-  const firstUrl = urls[0];
+  const urlRaw = await promptText("New Entry", "URL (optional — video/episode/directory):");
+  if (urlRaw === null) return;
+  const urls = parseUrlInput(urlRaw);
+  const firstUrl = urls[0] ?? "";
+
+  const pageUrlRaw = await promptText("New Entry", "Series page URL (optional):");
+  if (pageUrlRaw === null) return;
+  const pageUrl = pageUrlRaw.trim() || "";
+
+  if (!firstUrl && !pageUrl) {
+    showError("Provide at least one URL");
+    return;
+  }
+
   let useProxy = false;
-  
-  if (isYouTubeUrl(firstUrl)) {
+  if (firstUrl && isYouTubeUrl(firstUrl)) {
     const proxyRequired = await confirmDialog(
       "YouTube URL detected: Do you have VPN/proxy enabled? (Required for access)",
       "Yes"
@@ -1212,25 +1246,57 @@ async function showNewEntryModal(): Promise<void> {
     }
     useProxy = proxyRequired;
   }
-  
-  // Don't autofill URL as name - user must enter name manually
-  const name = await promptText("New Entry", "Name:");
-  if (name === null) return;
-  const key = (sanitiseKey(name) || name || "unnamed").trim();
+
+  let scrapeResult: ScrapeResult | null = null;
+  if (pageUrl) {
+    showInfo("Scraping series page...");
+    scrapeResult = await scrapeSeriesSource(pageUrl);
+    if (scrapeResult.ok) {
+      showInfo(`Found ${scrapeResult.episodes.length} episodes`);
+    } else {
+      const fallback = await confirmDialog(
+        "Could not parse series page. Continue anyway?",
+        "Continue"
+      );
+      if (!fallback) return;
+    }
+  }
+
+  let name = "";
+  while (true) {
+    const defaultName = scrapeResult?.title ?? "";
+    const entered = await promptText("New Entry", "Name (required):", defaultName);
+    if (entered === null) return;
+    if (/^https?:\/\//i.test(entered.trim())) {
+      showError("That looks like a URL — enter a name for the entry");
+      continue;
+    }
+    if (entered.trim()) { name = entered.trim(); break; }
+    showError("Name is required");
+  }
+  const key = (sanitiseKey(name) || name).trim();
   if (!key) { showError("Could not determine entry name"); return; }
   if (store[key]) {
     const ok = await confirmDialog(`"${key}" already exists. Overwrite?`, "Overwrite");
     if (!ok) return;
   }
-  
+
+  const isMovie = !pageUrl && (urls.length > 1 ? false : isDirectVideoUrl(firstUrl));
+
   const p: SeriesProgress = {
-    url: firstUrl, 
-    season: 1, 
-    episode: 0, 
+    url: scrapeResult?.episodes[0] ?? firstUrl,
+    season: 1,
+    episode: 0,
     timestamp: 0,
-    isMovie: urls.length > 1 ? false : isDirectVideoUrl(firstUrl),
-    manualUrls: urls.length > 1 ? urls : undefined,
-    // Store proxy preference for YouTube URLs
+    isMovie,
+    manualUrls: scrapeResult?.episodes ?? (urls.length > 1 ? urls : undefined),
+    ...(pageUrl && {
+      sourceUrl: pageUrl,
+      source: scrapeResult?.source ?? { kind: "series-page", variant: "hardsub", quality: "720p" },
+      knownEpisodes: scrapeResult?.episodes ?? [],
+      newEpisodeCount: 0,
+      lastEpisodeCheckAt: new Date().toISOString(),
+    }),
     ...(useProxy && { overview: "YouTube - VPN/proxy enabled" })
   };
   saveProgress(key, p);
@@ -1256,6 +1322,11 @@ async function showEditModal(): Promise<void> {
   if (newUrl.trim()) {
     const urls = parseUrlInput(newUrl);
     if (urls.length > 0) {
+      if (urls[0] !== p.url) {
+        p.timestamp = 0;
+        p.cacheOffset = 0;
+        p.newEpisodeCount = 0;
+      }
       p.url = urls[0];
       if (urls.length > 1) {
         p.manualUrls = urls;
@@ -1264,6 +1335,33 @@ async function showEditModal(): Promise<void> {
         p.manualUrls = undefined;
         p.isMovie = isDirectVideoUrl(urls[0]);
       }
+    }
+  }
+
+  const pageUrlPrompt = await promptText("Edit — Series Page URL", "Series page URL (Enter = keep):", p.sourceUrl ?? "");
+  if (pageUrlPrompt === null) return;
+  const newPageUrl = pageUrlPrompt.trim();
+  if (newPageUrl !== (p.sourceUrl ?? "")) {
+    if (newPageUrl) {
+      showInfo("Scraping series page...");
+      const result = await scrapeSeriesSource(newPageUrl);
+      if (result.ok) {
+        p.sourceUrl = newPageUrl;
+        p.source = result.source;
+        p.manualUrls = result.episodes;
+        p.knownEpisodes = result.episodes;
+        p.url = result.episodes[0] ?? p.url;
+        p.newEpisodeCount = 0;
+        p.lastEpisodeCheckAt = new Date().toISOString();
+        p.isMovie = false;
+        showInfo(`Found ${result.episodes.length} episodes`);
+      } else {
+        showInfo("Could not parse series page — keeping existing data");
+      }
+    } else {
+      p.sourceUrl = undefined;
+      p.source = undefined;
+      p.knownEpisodes = undefined;
     }
   }
 
@@ -1342,6 +1440,8 @@ function mergeEntryFields(keep: SeriesProjectEntry, other: SeriesProjectEntry): 
   const op = other.playerData as SeriesProgress;
 
   if (!kp.url && op.url) kp.url = op.url;
+  if (!kp.sourceUrl && op.sourceUrl) kp.sourceUrl = op.sourceUrl;
+  if (!kp.source && op.source) kp.source = op.source;
   if ((!kp.manualUrls || kp.manualUrls.length === 0) && op.manualUrls?.length) {
     kp.manualUrls = op.manualUrls;
   }
@@ -1356,6 +1456,14 @@ function mergeEntryFields(keep: SeriesProjectEntry, other: SeriesProjectEntry): 
   if (!keep._genreIds && other._genreIds) keep._genreIds = other._genreIds;
   if (!keep._category && other._category) keep._category = other._category;
   if (!keep.genres && other.genres) keep.genres = other.genres;
+
+  if (op.episodeTimestamps) {
+    kp.episodeTimestamps = mergeEpisodeTimestamps(kp.episodeTimestamps, op.episodeTimestamps);
+  }
+  if (op.knownEpisodes) {
+    const known = new Set([...(kp.knownEpisodes ?? []), ...op.knownEpisodes]);
+    kp.knownEpisodes = [...known];
+  }
 
   keep.playerData = kp;
   return keep;
@@ -1660,6 +1768,51 @@ function forceSync(): void {
   showInfo("Sync triggered");
 }
 
+async function checkNewEpisodes(): Promise<void> {
+  const entries = Object.keys(store).filter((k) => {
+    const p = store[k];
+    return p && p.source?.kind === "series-page" && !p.finished;
+  });
+  if (entries.length === 0) {
+    showInfo("No series-page entries to check");
+    return;
+  }
+  showInfo(`Checking ${entries.length} series for new episodes...`);
+  let totalNew = 0;
+  for (const k of entries) {
+    const p = store[k]!;
+    try {
+      const count = await refreshSeriesSource(p);
+      if (count > 0) {
+        saveProgress(k, p);
+        totalNew += count;
+      }
+    } catch {}
+  }
+  if (totalNew > 0) {
+    showInfo(`Found ${totalNew} new episode(s) across ${entries.length} series`);
+    forceRefresh();
+  } else {
+    showInfo("No new episodes found");
+  }
+}
+
+async function runStartupChecks(): Promise<void> {
+  const entries = Object.keys(store).filter((k) => {
+    const p = store[k];
+    return p && p.source?.kind === "series-page" && !p.finished;
+  });
+  if (entries.length === 0) return;
+  for (const k of entries) {
+    const p = store[k]!;
+    try {
+      const count = await refreshSeriesSource(p);
+      if (count > 0) saveProgress(k, p);
+    } catch {}
+  }
+  forceRefresh();
+}
+
 // ─── HELP ─────────────────────────────────────────────────────────────────────
 
 function showHelp(): void {
@@ -1689,6 +1842,7 @@ function showHelp(): void {
     `  {${HINT}-fg}u{/}           Dedupe series JSON file`,
     `  {${HINT}-fg}c{/}           Cache help`,
     `  {${HINT}-fg}s{/}           Force sync`,
+    `  {${HINT}-fg}C{/}           Check for new episodes`,
     `  {${HINT}-fg}q / Esc{/}     Quit`,
     "",
     `  {${HINT}-fg}Press any key to close{/}`,
@@ -1754,6 +1908,7 @@ function bindKeys(): void {
   screen.key(["u"],     guard(showDedupeModal));
   screen.key(["c"],     guard(showCacheHelp));
   screen.key(["s"],     guard(forceSync));
+  screen.key(["C"],     guard(checkNewEpisodes));
   screen.key(["?"],     guard(showHelp));
   screen.key(["t"], guard(() => {
     if (layoutMode !== "narrow") return;
@@ -1867,21 +2022,31 @@ async function main(): Promise<void> {
   });
   logToFile("TUI start");
   const args = process.argv.slice(2);
-  const wantsDetach = args.includes("--detach");
   const isDetached = args.includes("--detached") || process.env.PLAYER_TUI_DETACHED === "1";
-  
-  // Only enable kitty mode if explicitly requested for detachment
-  if (wantsDetach && !isDetached && !IS_TERMUX && hasKitty()) {
+  // Detach into a Kitty window by default; --no-detach keeps it in this terminal.
+  const wantsDetach =
+    !isDetached &&
+    !args.includes("--no-detach") &&
+    process.stdout.isTTY &&
+    hasKitty();
+
+  if (wantsDetach) {
     process.env.PLAYER_PLAY_IN_KITTY = "1";
     process.env.PLAYER_MPV_NO_TERMINAL = "1";
-  }
-  if (wantsDetach && !isDetached) {
     const scriptPath = resolve(process.argv[1] ?? "tui.ts");
-    const extraArgs = args.filter((a) => a !== "--detach");
+    const extraArgs = args.filter((a) => a !== "--detach" && a !== "--no-detach");
     const ok = tryDetachToKitty(scriptPath, extraArgs);
     if (ok) process.exit(0);
   }
   await maybeRunStorageSetupTui();
+
+  // The storage-setup prompt above uses node's readline, which leaves a
+  // keypress decoder armed on stdin even after rl.close(). blessed installs
+  // its own decoder, and with both active every keystroke is emitted twice
+  // ("s" types "ss"). Strip stdin's listeners so blessed starts clean.
+  process.stdin.removeAllListeners("keypress");
+  process.stdin.removeAllListeners("newListener");
+  process.stdin.removeAllListeners("data");
   // Silence console output during store init (sync logs, TLS warnings, etc.)
   const origLog  = console.log;
   const origWarn = console.warn;
@@ -1923,6 +2088,8 @@ async function main(): Promise<void> {
   refreshList();
   listBox.focus();
   screen.render();
+
+  runStartupChecks().catch(() => {});
 }
 
 main().catch((e) => {

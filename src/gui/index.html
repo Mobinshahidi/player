@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>player</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header id="header">
+        <div class="brand"><span class="accent">🎬 player</span></div>
+        <div class="header-right">
+          <span id="total" class="hint"></span>
+          <span id="badge-local" class="badge-local"></span>
+          <span class="lang-switch">
+            <button type="button" id="lang-en" class="lang-btn">EN</button>
+            <button type="button" id="lang-fa" class="lang-btn">فا</button>
+          </span>
+          <input id="search" autocomplete="off" spellcheck="false" />
+        </div>
+      </header>
+
+      <main id="main">
+        <section id="list-panel">
+          <ul id="list"></ul>
+          <div id="empty-list" class="empty hidden"></div>
+          <button id="add-btn" class="primary"></button>
+        </section>
+
+        <section id="detail-panel">
+          <div id="detail-empty" class="empty"></div>
+          <div id="detail" class="hidden"></div>
+        </section>
+      </main>
+
+      <div id="nowplaying" class="hidden">
+        <div class="np-left">
+          <span class="np-dot"></span>
+          <span id="np-title"></span>
+          <span id="np-cache" class="hint"></span>
+        </div>
+        <div class="np-right">
+          <button id="np-pause" class="ghost"></button>
+          <button id="np-next" class="ghost"></button>
+          <button id="np-stop" class="ghost"></button>
+        </div>
+      </div>
+
+      <footer id="footer"><span class="hint" id="footer-hint"></span></footer>
+    </div>
+
+    <div id="modal-root" class="hidden"></div>
+    <div id="toast" class="hidden"></div>
+    <div id="loading" class="hidden">
+      <div class="spinner"></div>
+      <span id="loading-text"></span>
+    </div>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

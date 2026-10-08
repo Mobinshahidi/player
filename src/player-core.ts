@@ -60,6 +60,7 @@ export function setSyncStatus(s: SyncStatus, err = "") {
 
 export interface SeriesProgress {
   url: string;
+  sourceUrl?: string;
   season: number;
   episode: number;
   timestamp: number;
@@ -70,7 +71,13 @@ export interface SeriesProgress {
   isOnetime?: boolean;
   overview?: string;
   genres?: string[];
+  poster?: string;
   cacheOffset?: number;
+  episodeTimestamps?: Record<string, number>;
+  source?: { kind: "series-page" | "directory"; variant?: string; quality?: string };
+  knownEpisodes?: string[];
+  lastEpisodeCheckAt?: string;
+  newEpisodeCount?: number;
 }
 
 export type ProgressStore = Record<string, SeriesProgress>;
@@ -442,8 +449,28 @@ export function mergeStores(
         rp.timestamp > lp.timestamp) ||
       (!lp.finished && rp.finished);
     if (ahead) {
-      merged[key] = rp;
+      const mergedEntry = { ...rp };
+      if (!mergedEntry.sourceUrl && lp.sourceUrl) mergedEntry.sourceUrl = lp.sourceUrl;
+      if (lp.episodeTimestamps) {
+        mergedEntry.episodeTimestamps = mergeEpisodeTimestamps(rp.episodeTimestamps, lp.episodeTimestamps);
+      }
+      if (lp.knownEpisodes) {
+        const known = new Set([...(rp.knownEpisodes ?? []), ...lp.knownEpisodes]);
+        mergedEntry.knownEpisodes = [...known];
+      }
+      merged[key] = mergedEntry;
       remoteWon.push(key);
+    } else {
+      if (rp.episodeTimestamps || rp.knownEpisodes || rp.sourceUrl) {
+        const mergedEntry = { ...lp };
+        if (!mergedEntry.sourceUrl && rp.sourceUrl) mergedEntry.sourceUrl = rp.sourceUrl;
+        mergedEntry.episodeTimestamps = mergeEpisodeTimestamps(lp.episodeTimestamps, rp.episodeTimestamps);
+        if (rp.knownEpisodes) {
+          const known = new Set([...(lp.knownEpisodes ?? []), ...rp.knownEpisodes]);
+          mergedEntry.knownEpisodes = [...known];
+        }
+        merged[key] = mergedEntry;
+      }
     }
   }
   return { merged, remoteWon };
@@ -614,9 +641,18 @@ async function initStorage(): Promise<void> {
   }
 }
 
-export async function initStore() {
+export async function initStore(opts?: { localOnly?: boolean }) {
   ensureConfigDir();
-  await initStorage();
+  if (opts?.localOnly) {
+    // GUI mode: never touch cloud storage, even if config/secrets exist.
+    storageMode = "local";
+    storageProvider = null;
+    storageService = new StorageService("local", null, null);
+    CLOUD_SYNC = false;
+    storageWarnings = [];
+  } else {
+    await initStorage();
+  }
   store = loadLocalStore();
   // Clean up any garbage numeric-key entries from a bad import
   const { cleaned, removed } = cleanGarbageEntries(store);
@@ -675,6 +711,35 @@ export async function initStore() {
       console.log(
         `[cleanup] Normalised ${changes} key(s) (spaces → underscores).`,
       );
+    }
+  }
+  // Seed episodeTimestamps for direct-video entries with existing timestamp
+  {
+    let seeded = 0;
+    for (const [, v] of Object.entries(store)) {
+      if (!v.episodeTimestamps && v.timestamp > 0 && isDirectVideoUrl(v.url)) {
+        const id = episodeIdentity(v.url, v.season, v.episode);
+        v.episodeTimestamps = { [id]: v.timestamp };
+        seeded++;
+      }
+    }
+    if (seeded > 0) {
+      saveLocalStore(store);
+      console.log(`[migrate] Seeded per-episode positions for ${seeded} direct-video entries.`);
+    }
+  }
+  // Backfill sourceUrl for series-page entries that lack it
+  {
+    let backfilled = 0;
+    for (const [, v] of Object.entries(store)) {
+      if (v.source?.kind === "series-page" && !v.sourceUrl && !isDirectVideoUrl(v.url)) {
+        v.sourceUrl = v.url;
+        backfilled++;
+      }
+    }
+    if (backfilled > 0) {
+      saveLocalStore(store);
+      console.log(`[migrate] Backfilled sourceUrl for ${backfilled} series-page entries.`);
     }
   }
   loadSettings();
@@ -792,6 +857,441 @@ export function clearEpisodeCache(url: string) {
     } catch {}
 }
 
+// ─── SERIES PAGE SCRAPE ──────────────────────────────────────────────────────
+// Parses WordPress/Dooplay-style series pages that embed direct .mkv links
+// in handleDownloadClick() and plain <a href="…mkv"> elements.
+
+export interface ScrapedEpisode {
+  season: number;
+  episode: number;
+  variant: string;
+  quality: string;
+  url: string;
+}
+
+const PERSIAN_SEASON_MAP: Record<string, number> = {
+  "اول": 1, "دوم": 2, "سوم": 3, "چهارم": 4, "پنجم": 5,
+  "ششم": 6, "هفتم": 7, "هشتم": 8, "نهم": 9, "دهم": 10,
+};
+
+function decodeHtmlEntities(s: string): string {
+  return s
+    .replace(/&#0?38;/g, "&")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'");
+}
+
+function parsePersianSeasonLabel(label: string): number | null {
+  for (const [word, num] of Object.entries(PERSIAN_SEASON_MAP)) {
+    if (label.includes(word)) return num;
+  }
+  const enMatch = label.match(/season\s+(\d+)/i);
+  if (enMatch) return parseInt(enMatch[1], 10);
+  return null;
+}
+
+export function isDubbedName(name: string): boolean {
+  return /dubbed|dubbled|دوبله|دوبلد/i.test(name);
+}
+
+function qualityRank(q: string): number {
+  const ql = q.toLowerCase();
+  if (/720p(?!\.10)/.test(ql)) return 0;
+  if (/720p/.test(ql)) return 1;
+  if (/1080p(?!\.10)/.test(ql)) return 2;
+  if (/1080p/.test(ql)) return 3;
+  if (/480p/.test(ql)) return 4;
+  if (/2160p|4k/i.test(ql)) return 5;
+  return 6;
+}
+
+export function isSeriesPageHtml(html: string): boolean {
+  return /handleDownloadClick\(|series-downloaditems|download-list/.test(html);
+}
+
+export function parseSeriesPage(html: string, baseUrl: string): {
+  title: string;
+  episodes: ScrapedEpisode[];
+} {
+  const h = decodeHtmlEntities(html);
+
+  let title = "";
+  const titleMatch = h.match(/<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([^<]+)<\/h1>/i);
+  if (titleMatch) title = titleMatch[1].trim();
+
+  const episodes: ScrapedEpisode[] = [];
+  const seen = new Set<string>();
+
+  const seasonBoxes = h.split(/<div[^>]*class="download-season[^"]*"/i);
+  for (let si = 1; si < seasonBoxes.length; si++) {
+    const box = seasonBoxes[si]!;
+
+    const btnMatch = box.match(/<button[^>]*>(.*?)<\/button>/s);
+    const boxLabel = btnMatch
+      ? btnMatch[1].replace(/<[^>]+>/g, " ").trim()
+      : "";
+    const seasonFromLabel = parsePersianSeasonLabel(boxLabel);
+
+    const boxVariant = isDubbedName(boxLabel) ? "dubbled" : "hardsub";
+
+    const dlSections = box.split(/<div[^>]*class="download-list[^"]*"/i);
+    for (let di = 1; di < dlSections.length; di++) {
+      const section = dlSections[di]!;
+
+      const dlUrls = [
+        ...section.matchAll(/handleDownloadClick\('([^']+\.mkv)'\)/gi),
+      ].map((m) => m[1]!);
+
+      for (const url of dlUrls) {
+        const filename = decodeURIComponent(url.split("/").pop()!.split("?")[0]);
+        const seMatch = filename.match(/[Ss](\d{1,2})[Ee](\d{1,3})/);
+        const season = seMatch
+          ? parseInt(seMatch[1], 10)
+          : seasonFromLabel ?? 1;
+        const episode = seMatch
+          ? parseInt(seMatch[2], 10) - 1
+          : 0;
+
+        const qualMatch = filename.match(/(480p|720p|1080p|2160p|4K)/i);
+        const quality = qualMatch ? qualMatch[1].toLowerCase() : "unknown";
+
+        const variant = isDubbedName(filename) ? "dubbled" : boxVariant;
+
+        const key = `${season}:${episode}:${variant}:${quality}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+
+        episodes.push({ season, episode, variant, quality, url });
+      }
+    }
+  }
+
+  const links = [...h.matchAll(/href="([^"]+\.mkv)"/gi)];
+  if (episodes.length === 0 && links.length > 0) {
+    for (const m of links) {
+      const url = m[1]!;
+      const filename = decodeURIComponent(url.split("/").pop()!.split("?")[0]);
+      const seMatch = filename.match(/[Ss](\d{1,2})[Ee](\d{1,3})/);
+      if (!seMatch) continue;
+      const season = parseInt(seMatch[1], 10);
+      const episode = parseInt(seMatch[2], 10) - 1;
+      const qualMatch = filename.match(/(480p|720p|1080p|2160p|4K)/i);
+      const quality = qualMatch ? qualMatch[1].toLowerCase() : "unknown";
+      const isDub = isDubbedName(filename);
+      const variant = isDub ? "dubbled" : "hardsub";
+      const key = `${season}:${episode}:${variant}:${quality}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      episodes.push({ season, episode, variant, quality, url });
+    }
+  }
+
+  episodes.sort((a, b) => a.season - b.season || a.episode - b.episode);
+  return { title, episodes };
+}
+
+// Pick one URL per (season, episode) matching the preferred variant/quality.
+export function selectEpisodes(
+  all: ScrapedEpisode[],
+  opts?: { variant?: string; quality?: string },
+): string[] {
+  const prefVariant = (opts?.variant ?? "hardsub").toLowerCase();
+  const prefQuality = (opts?.quality ?? "720p").toLowerCase();
+
+  const grouped = new Map<string, ScrapedEpisode[]>();
+  for (const ep of all) {
+    const gk = `${ep.season}:${ep.episode}`;
+    const arr = grouped.get(gk) ?? [];
+    arr.push(ep);
+    grouped.set(gk, arr);
+  }
+
+  const chosen: string[] = [];
+  const sortedKeys = [...grouped.keys()].sort((a, b) => {
+    const [as, ae] = a.split(":").map(Number);
+    const [bs, be] = b.split(":").map(Number);
+    return as! - bs! || ae! - be!;
+  });
+
+  for (const gk of sortedKeys) {
+    const eps = grouped.get(gk)!;
+
+    let candidates = eps.filter((e) => e.variant === prefVariant);
+    if (candidates.length === 0) candidates = eps;
+    candidates.sort((a, b) => qualityRank(a.quality) - qualityRank(b.quality));
+
+    let best = candidates.find((c) => c.quality.includes(prefQuality));
+    if (!best) best = candidates[0]!;
+    if (best) chosen.push(best.url);
+  }
+
+  return chosen;
+}
+
+export function resolveSeriesPage(
+  html: string,
+  baseUrl: string,
+  opts?: { variant?: string; quality?: string },
+): { title: string; episodes: string[] } {
+  const { title, episodes: all } = parseSeriesPage(html, baseUrl);
+  return { title, episodes: selectEpisodes(all, opts) };
+}
+
+// ─── SERIES PAGE METADATA + INFO (GUI) ───────────────────────────────────────
+
+export interface SeriesMeta {
+  title: string;
+  description: string;
+  poster: string;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function metaContents(
+  html: string,
+  key: string,
+  attr: "property" | "name",
+): string[] {
+  const k = escapeRegExp(key);
+  const out: string[] = [];
+  const re1 = new RegExp(
+    `<meta[^>]*${attr}=["']${k}["'][^>]*content=["']([^"']*)["']`,
+    "gi",
+  );
+  for (const m of html.matchAll(re1)) if (m[1]) out.push(m[1].trim());
+  const re2 = new RegExp(
+    `<meta[^>]*content=["']([^"']*)["'][^>]*${attr}=["']${k}["']`,
+    "gi",
+  );
+  for (const m of html.matchAll(re2)) if (m[1]) out.push(m[1].trim());
+  return out.filter(Boolean);
+}
+
+function metaContent(html: string, key: string, attr: "property" | "name"): string {
+  return metaContents(html, key, attr)[0] ?? "";
+}
+
+export function parseSeriesMeta(html: string, _baseUrl = ""): SeriesMeta {
+  const h = decodeHtmlEntities(html);
+
+  let title = "";
+  const titleMatch = h.match(
+    /<h1[^>]*class="[^"]*entry-title[^"]*"[^>]*>([^<]+)<\/h1>/i,
+  );
+  if (titleMatch) title = titleMatch[1]!.trim();
+  if (!title) title = metaContent(h, "og:title", "property");
+  if (!title) {
+    const t = h.match(/<title[^>]*>([^<]*)<\/title>/i);
+    if (t) title = t[1]!.trim();
+  }
+
+  // Some pages repeat og:description with a generic site blurb first; the
+  // real plot is usually the longest candidate.
+  const descCandidates = [
+    ...metaContents(h, "og:description", "property"),
+    ...metaContents(h, "description", "name"),
+    ...metaContents(h, "twitter:description", "name"),
+  ];
+  const description =
+    descCandidates.sort((a, b) => b.length - a.length)[0] ?? "";
+
+  let poster = "";
+  const thumb = h.match(/"thumbnailUrl"\s*:\s*"([^"]+)"/i);
+  if (thumb) poster = thumb[1]!;
+  if (!poster) poster = metaContent(h, "og:image", "property");
+  if (!poster) poster = metaContent(h, "twitter:image", "name");
+
+  return { title, description, poster };
+}
+
+export interface SeriesPageInfo {
+  title: string;
+  description: string;
+  poster: string;
+  episodes: ScrapedEpisode[];
+  summary: SeriesInfoSummary;
+}
+
+export function parseSeriesPageInfo(html: string, baseUrl: string): SeriesPageInfo {
+  const { title: pageTitle, episodes } = parseSeriesPage(html, baseUrl);
+  const meta = parseSeriesMeta(html, baseUrl);
+  return {
+    title: meta.title || pageTitle,
+    description: meta.description,
+    poster: meta.poster,
+    episodes,
+    summary: summarizeSeriesInfo(episodes),
+  };
+}
+
+export interface SeriesInfoSummary {
+  totalEpisodes: number;
+  seasons: { season: number; episodeCount: number }[];
+  variants: string[];
+  qualities: string[];
+}
+
+const QUALITY_ORDER = ["480p", "720p", "1080p", "2160p", "4k", "unknown"];
+
+function sortQuality(qs: string[]): string[] {
+  return [...qs].sort((a, b) => {
+    const ia = QUALITY_ORDER.indexOf(a.toLowerCase());
+    const ib = QUALITY_ORDER.indexOf(b.toLowerCase());
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+  });
+}
+
+export function summarizeSeriesInfo(episodes: ScrapedEpisode[]): SeriesInfoSummary {
+  const seen = new Set<string>();
+  const seasonMap = new Map<number, Set<number>>();
+  const variants = new Set<string>();
+  const qualities = new Set<string>();
+  for (const ep of episodes) {
+    seen.add(`${ep.season}:${ep.episode}`);
+    if (!seasonMap.has(ep.season)) seasonMap.set(ep.season, new Set());
+    seasonMap.get(ep.season)!.add(ep.episode);
+    variants.add(ep.variant);
+    qualities.add(ep.quality);
+  }
+  const seasons = [...seasonMap.entries()]
+    .map(([season, eps]) => ({ season, episodeCount: eps.size }))
+    .sort((a, b) => a.season - b.season);
+  return {
+    totalEpisodes: seen.size,
+    seasons,
+    variants: [...variants],
+    qualities: sortQuality([...qualities]),
+  };
+}
+
+export const SERIES_INFO_CACHE_DIR = join(CONFIG_DIR, "series-info-cache");
+export const SERIES_INFO_TTL_MS = 60 * 60 * 1000;
+
+export interface SeriesInfo {
+  url: string;
+  fetchedAt: number;
+  title: string;
+  description: string;
+  poster: string;
+  episodes: ScrapedEpisode[];
+  summary: SeriesInfoSummary;
+}
+
+export function seriesInfoCachePath(url: string): string {
+  return join(SERIES_INFO_CACHE_DIR, `${cacheKeyForUrl(url)}.json`);
+}
+
+export function loadSeriesInfoCache(url: string): SeriesInfo | null {
+  const p = seriesInfoCachePath(url);
+  if (!existsSync(p)) return null;
+  try {
+    const info: SeriesInfo = JSON.parse(readFileSync(p, "utf-8"));
+    if (info.url !== url) return null;
+    if (Date.now() - info.fetchedAt > SERIES_INFO_TTL_MS) return null;
+    if (!info.summary) info.summary = summarizeSeriesInfo(info.episodes);
+    return info;
+  } catch {
+    return null;
+  }
+}
+
+export function saveSeriesInfoCache(info: SeriesInfo): void {
+  try {
+    if (!existsSync(SERIES_INFO_CACHE_DIR))
+      mkdirSync(SERIES_INFO_CACHE_DIR, { recursive: true });
+    writeFileSync(seriesInfoCachePath(info.url), JSON.stringify(info, null, 2));
+  } catch {}
+}
+
+export interface ScrapeInfoResult {
+  ok: boolean;
+  url: string;
+  title: string;
+  description: string;
+  poster: string;
+  summary: SeriesInfoSummary;
+  episodes: ScrapedEpisode[];
+  cached: boolean;
+  error?: string;
+}
+
+const EMPTY_SUMMARY: SeriesInfoSummary = {
+  totalEpisodes: 0,
+  seasons: [],
+  variants: [],
+  qualities: [],
+};
+
+export async function scrapeSeriesPageInfo(
+  pageUrl: string,
+  opts?: { force?: boolean },
+): Promise<ScrapeInfoResult> {
+  const blank = (error: string): ScrapeInfoResult => ({
+    ok: false,
+    url: pageUrl,
+    title: "",
+    description: "",
+    poster: "",
+    summary: EMPTY_SUMMARY,
+    episodes: [],
+    cached: false,
+    error,
+  });
+
+  if (!opts?.force) {
+    const cached = loadSeriesInfoCache(pageUrl);
+    if (cached) {
+      return {
+        ok: true,
+        url: pageUrl,
+        title: cached.title,
+        description: cached.description,
+        poster: cached.poster,
+        summary: cached.summary,
+        episodes: cached.episodes,
+        cached: true,
+      };
+    }
+  }
+
+  try {
+    const res = await fetch(pageUrl, { headers: { "User-Agent": FETCH_UA } });
+    if (!res.ok) return blank(`HTTP ${res.status}`);
+    const html = await res.text();
+    if (!isSeriesPageHtml(html)) return blank("not a series page");
+    const page = parseSeriesPageInfo(html, pageUrl);
+    if (page.episodes.length === 0) return blank("no episodes found");
+
+    const info: SeriesInfo = {
+      url: pageUrl,
+      fetchedAt: Date.now(),
+      title: page.title,
+      description: page.description,
+      poster: page.poster,
+      episodes: page.episodes,
+      summary: page.summary,
+    };
+    saveSeriesInfoCache(info);
+    return {
+      ok: true,
+      url: pageUrl,
+      title: info.title,
+      description: info.description,
+      poster: info.poster,
+      summary: info.summary,
+      episodes: info.episodes,
+      cached: false,
+    };
+  } catch (e: any) {
+    return blank(e?.message ?? "scrape failed");
+  }
+}
+
 // ─── URL BLOCK PARSER ────────────────────────────────────────────────────────
 // FIX: increased idle timeout from 300ms → 800ms so large pastes (20+ URLs)
 // don't get cut off. Also handles the common format where all URLs are
@@ -833,6 +1333,73 @@ export function sanitiseKey(name: string): string {
 
 export function sanitiseDirName(name: string): string {
   return sanitiseKey(name);
+}
+
+// ─── EPISODE IDENTITY + PER-EPISODE TIMING ────────────────────────────────────
+
+export function episodeIdentity(url: string, season?: number, episode?: number): string {
+  const name = decodeURIComponent(url.split("/").pop()!.split("?")[0]);
+  const seMatch = name.match(/[Ss](\d{1,2})[Ee](\d{1,3})/);
+  if (seMatch) return `S${seMatch[1]}E${seMatch[2]}`;
+  if (season != null && episode != null) {
+    return `S${String(season).padStart(2, "0")}E${String(episode + 1).padStart(2, "0")}`;
+  }
+  const base = name.replace(/\.[^.]+$/, "");
+  if (base) return base;
+  return url;
+}
+
+export function getEpisodeTimestamp(
+  p: SeriesProgress,
+  url: string,
+  season: number,
+  episode: number,
+): number {
+  const id = episodeIdentity(url, season, episode);
+  if (p.episodeTimestamps?.[id] != null) return p.episodeTimestamps[id]!;
+  if (p.url === url && p.season === season && p.episode === episode) return p.timestamp;
+  return 0;
+}
+
+export function setEpisodePosition(
+  p: SeriesProgress,
+  url: string,
+  season: number,
+  episode: number,
+  time: number,
+): SeriesProgress {
+  const id = episodeIdentity(url, season, episode);
+  const episodeTimestamps = { ...(p.episodeTimestamps ?? {}), [id]: time };
+  return { ...p, episodeTimestamps, timestamp: time, season, episode };
+}
+
+export function episodeIdFromUrl(url: string): string {
+  return episodeIdentity(url);
+}
+
+export function mergeEpisodeTimestamps(
+  a?: Record<string, number>,
+  b?: Record<string, number>,
+): Record<string, number> | undefined {
+  if (!a && !b) return undefined;
+  const merged: Record<string, number> = { ...(a ?? {}) };
+  if (b) {
+    for (const [k, v] of Object.entries(b)) {
+      merged[k] = Math.max(merged[k] ?? 0, v);
+    }
+  }
+  return merged;
+}
+
+export function seriesHasMultipleSeasons(p: SeriesProgress): boolean {
+  if (!p.manualUrls || p.manualUrls.length < 2) return false;
+  const seasons = new Set<string>();
+  for (const u of p.manualUrls) {
+    const name = decodeURIComponent(u.split("/").pop()!.split("?")[0]);
+    const m = name.match(/[Ss](\d{1,2})[Ee]\d{1,3}/);
+    if (m) seasons.add(m[1]);
+  }
+  return seasons.size > 1;
 }
 
 // ─── VIDEO CACHE PATH ─────────────────────────────────────────────────────────
@@ -913,6 +1480,17 @@ export async function queryMpv(): Promise<{
     );
     setTimeout(() => finish(null), 2000);
   });
+}
+
+// Send a raw JSON IPC command to the running mpv instance, if any.
+export function sendMpvCommand(cmd: object): void {
+  if (!existsSync(MPV_SOCKET)) return;
+  const c = net.createConnection(MPV_SOCKET);
+  c.on("connect", () => {
+    c.write(JSON.stringify(cmd) + "\n");
+    c.end();
+  });
+  c.on("error", () => {});
 }
 
 // ─── VIDEO DOWNLOAD ───────────────────────────────────────────────────────────
@@ -1032,6 +1610,24 @@ export function deleteVideoCache(episodeUrl: string, seriesLabel = "") {
   } catch (e) {
     console.warn(`[cache] Could not delete: ${(e as Error).message}`);
   }
+}
+
+// Delete cached files for every URL in a list. Returns the number removed.
+export function deleteSeasonCache(
+  episodeUrls: string[],
+  seriesLabel = "",
+): number {
+  let removed = 0;
+  for (const url of episodeUrls) {
+    const p = videoCachePath(url, seriesLabel);
+    if (!existsSync(p)) continue;
+    try {
+      unlinkSync(p);
+      removed++;
+    } catch {}
+  }
+  if (removed > 0) console.log(`[cache] Deleted ${removed} file(s).`);
+  return removed;
 }
 
 export const activePrefetches: ChildProcess[] = [];
@@ -1531,30 +2127,43 @@ export async function playWithMpv(
 export async function fetchDirectoryListing(
   url: string,
   signal?: AbortSignal,
+  opts?: { force?: boolean },
 ): Promise<string[]> {
-  url = ensureTrailingSlash(url);
-  const cached = loadEpisodeCache(url);
-  if (cached) {
-    console.log(
-      `[cache] Using cached episode list (${cached.length} episodes)`,
-    );
-    return cached;
+  const effectiveUrl = ensureTrailingSlash(url);
+  if (!opts?.force) {
+    const cached = loadEpisodeCache(effectiveUrl);
+    if (cached) {
+      console.log(
+        `[cache] Using cached episode list (${cached.length} episodes)`,
+      );
+      return cached;
+    }
   }
-  const response = await fetch(url, { signal });
+  const response = await fetch(effectiveUrl, {
+    signal,
+    headers: { "User-Agent": FETCH_UA },
+  });
   if (!response.ok)
     throw new Error(`HTTP ${response.status}: ${response.statusText}`);
   const html = await response.text();
+
+  if (isSeriesPageHtml(html)) {
+    const { episodes } = resolveSeriesPage(html, effectiveUrl);
+    if (episodes.length > 0) saveEpisodeCache(effectiveUrl, episodes);
+    return episodes;
+  }
+
   const links: string[] = [];
   const regex = /href="([^"]+\.(?:mp4|mkv|avi|mov|webm))"/gi;
   let match;
   while ((match = regex.exec(html)) !== null) {
     const f = match[1].split("?")[0];
-    links.push(f.startsWith("http") ? f : new URL(f, url).href);
+    links.push(f.startsWith("http") ? f : new URL(f, effectiveUrl).href);
   }
   const episodes = [...new Set(links)].sort(
     (a, b) => extractEpisodeNumber(a) - extractEpisodeNumber(b),
   );
-  if (episodes.length > 0) saveEpisodeCache(url, episodes);
+  if (episodes.length > 0) saveEpisodeCache(effectiveUrl, episodes);
   return episodes;
 }
 
@@ -1690,6 +2299,137 @@ export async function resolveEpisodes(
   return episodes;
 }
 
+// ─── SERIES SOURCE + NEW EPISODE CHECK ───────────────────────────────────────
+
+const FETCH_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36";
+
+export interface ScrapeResult {
+  ok: boolean;
+  title: string;
+  episodes: string[];
+  source: { kind: "series-page"; variant: string; quality: string };
+}
+
+export async function scrapeSeriesSource(
+  pageUrl: string,
+  opts?: { variant?: string; quality?: string },
+): Promise<ScrapeResult> {
+  const variant = opts?.variant ?? "hardsub";
+  const quality = opts?.quality ?? "720p";
+  const empty: ScrapeResult = {
+    ok: false, title: "", episodes: [],
+    source: { kind: "series-page", variant, quality },
+  };
+  try {
+    const res = await fetch(pageUrl, { headers: { "User-Agent": FETCH_UA } });
+    if (!res.ok) return empty;
+    const html = await res.text();
+    if (!isSeriesPageHtml(html)) return empty;
+
+    const { title, episodes } = resolveSeriesPage(html, pageUrl, { variant, quality });
+    if (episodes.length === 0) return empty;
+
+    return { ok: true, title, episodes, source: { kind: "series-page", variant, quality } };
+  } catch (e: any) {
+    console.warn(`[series] Failed to scrape series page: ${e.message}`);
+    return empty;
+  }
+}
+
+export async function ensureSeriesSource(p: SeriesProgress): Promise<boolean> {
+  if (p.isMovie || p.manualUrls?.length || p.source?.kind) return false;
+  const target = p.sourceUrl ?? p.url;
+  if (!target || isDirectVideoUrl(target)) return false;
+
+  const result = await scrapeSeriesSource(target, p.source);
+  if (!result.ok) return false;
+
+  p.manualUrls = result.episodes;
+  p.knownEpisodes = result.episodes;
+  p.source = result.source;
+  p.sourceUrl = target;
+  p.url = result.episodes[0] ?? target;
+  p.newEpisodeCount = 0;
+  p.lastEpisodeCheckAt = new Date().toISOString();
+  return true;
+}
+
+export function episodeKeyFromUrl(url: string): string | null {
+  const name = decodeURIComponent(url.split("/").pop()!.split("?")[0]);
+  const m = name.match(/[Ss](\d{1,2})[Ee](\d{1,3})/);
+  if (!m) return null;
+  return `${parseInt(m[1], 10)}:${parseInt(m[2], 10)}`;
+}
+
+export async function checkForNewEpisodes(
+  p: SeriesProgress,
+): Promise<{ newEpisodes: string[]; knownEpisodes: string[] }> {
+  if (p.isMovie || p.finished || p.source?.kind !== "series-page") {
+    return { newEpisodes: [], knownEpisodes: p.knownEpisodes ?? [] };
+  }
+  const target = p.sourceUrl ?? p.url;
+  if (!target || isDirectVideoUrl(target)) {
+    return { newEpisodes: [], knownEpisodes: p.knownEpisodes ?? [] };
+  }
+
+  try {
+    const res = await fetch(target, { headers: { "User-Agent": FETCH_UA } });
+    if (!res.ok) return { newEpisodes: [], knownEpisodes: p.knownEpisodes ?? [] };
+    const html = await res.text();
+    if (!isSeriesPageHtml(html)) {
+      return { newEpisodes: [], knownEpisodes: p.knownEpisodes ?? [] };
+    }
+
+    const { episodes } = resolveSeriesPage(html, target, p.source);
+
+    const knownKeys = new Set(
+      (p.knownEpisodes ?? []).map((u) => episodeKeyFromUrl(u)).filter(Boolean),
+    );
+
+    const newEpisodes = episodes.filter((url) => {
+      const k = episodeKeyFromUrl(url);
+      return k ? !knownKeys.has(k) : true;
+    });
+
+    const allKnown = new Set(p.knownEpisodes ?? []);
+    for (const url of episodes) allKnown.add(url);
+
+    return {
+      newEpisodes,
+      knownEpisodes: [...allKnown],
+    };
+  } catch (e: any) {
+    console.warn(`[check] Failed to check for new episodes: ${e.message}`);
+    return { newEpisodes: [], knownEpisodes: p.knownEpisodes ?? [] };
+  }
+}
+
+export async function refreshSeriesSource(
+  p: SeriesProgress,
+): Promise<number> {
+  const { newEpisodes, knownEpisodes } = await checkForNewEpisodes(p);
+  if (newEpisodes.length > 0) {
+    const existingManual = p.manualUrls ?? [];
+    const existingById = new Map<string, string>();
+    for (const u of existingManual) {
+      const k = episodeKeyFromUrl(u);
+      if (k) existingById.set(k, u);
+    }
+    for (const url of newEpisodes) {
+      const k = episodeKeyFromUrl(url);
+      if (k) existingById.set(k, url);
+    }
+    p.manualUrls = [...existingById.values()];
+    p.knownEpisodes = knownEpisodes;
+    p.newEpisodeCount = (p.newEpisodeCount ?? 0) + newEpisodes.length;
+    p.lastEpisodeCheckAt = new Date().toISOString();
+  } else {
+    p.knownEpisodes = knownEpisodes;
+    p.lastEpisodeCheckAt = new Date().toISOString();
+  }
+  return newEpisodes.length;
+}
+
 // ─── RENDER PROGRESS ─────────────────────────────────────────────────────────
 
 export function renderProgress(p: SeriesProgress): string {
@@ -1778,6 +2518,7 @@ export function storeToSeriesProject(s: ProgressStore): SeriesProjectEntry[] {
     };
     if (p.overview) entry._overview = p.overview;
     if (p.genres && p.genres.length > 0) entry.genres = p.genres;
+    if (p.poster) entry.poster = p.poster;
     return entry;
   });
 }
@@ -1800,6 +2541,7 @@ export function parseImportFile(raw: unknown): ProgressStore {
       if (!p.overview && entry._overview) p.overview = entry._overview;
       if ((!p.genres || p.genres.length === 0) && entry.genres)
         p.genres = entry.genres;
+      if (!p.poster && entry.poster) p.poster = entry.poster;
       result[sanitiseKey(key)] = p;
     }
     return result;

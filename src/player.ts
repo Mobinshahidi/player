@@ -46,6 +46,14 @@ import {
   clearEpisodeCache,
   cleanFilename,
   findMpv,
+  getEpisodeTimestamp,
+  setEpisodePosition,
+  seriesHasMultipleSeasons,
+  ensureSeriesSource,
+  refreshSeriesSource,
+  scrapeSeriesSource,
+  isSeriesPageHtml,
+  resolveSeriesPage,
 } from "./player-core.js";
 
 // ─── READLINE HELPERS ─────────────────────────────────────────────────────────
@@ -352,7 +360,7 @@ async function searchAndPlay(): Promise<PlayTarget | null> {
         p: saved,
         season: saved.season,
         episode: saved.episode,
-        timestamp: saved.timestamp,
+        timestamp: getEpisodeTimestamp(saved, saved.url, saved.season, saved.episode),
       };
     } else if (action === "e" || action === "edit") {
       const sub = (
@@ -431,6 +439,7 @@ async function interactiveMenu(): Promise<PlayTarget | null> {
   console.log("│   /)  Search");
   console.log("│   e)  Edit series name / URL / status");
   console.log("│   d)  Remove a series");
+  console.log("│   c)  Check for new episodes");
   console.log("│   i)  Import progress from file");
   console.log("│   x)  Export progress to file");
   console.log("│   q)  Quit");
@@ -487,7 +496,7 @@ async function interactiveMenu(): Promise<PlayTarget | null> {
         p: saved,
         season: saved.season,
         episode: saved.episode,
-        timestamp: saved.timestamp,
+        timestamp: getEpisodeTimestamp(saved, saved.url, saved.season, saved.episode),
       };
     }
   }
@@ -556,6 +565,36 @@ async function interactiveMenu(): Promise<PlayTarget | null> {
       console.log(
         `"${oldKey}" marked as ${store[oldKey]!.isMovie ? "movie" : "not movie"}.`,
       );
+    }
+    return interactiveMenu();
+  }
+
+  if (lower === "c") {
+    const entries = Object.keys(store).filter((k) => {
+      const p = store[k];
+      return p && p.source?.kind === "series-page" && !p.finished;
+    });
+    if (entries.length === 0) {
+      console.log("\nNo series-page entries to check.");
+      return interactiveMenu();
+    }
+    console.log(`\nChecking ${entries.length} series for new episodes...`);
+    let totalNew = 0;
+    for (const k of entries) {
+      const p = store[k]!;
+      try {
+        const count = await refreshSeriesSource(p);
+        if (count > 0) {
+          saveProgress(k, p);
+          totalNew += count;
+          console.log(`  +${count} new: ${k}`);
+        }
+      } catch {}
+    }
+    if (totalNew > 0) {
+      console.log(`\n✓ Found ${totalNew} new episode(s) across ${entries.length} series`);
+    } else {
+      console.log("\nNo new episodes found.");
     }
     return interactiveMenu();
   }
@@ -699,7 +738,7 @@ async function interactiveMenu(): Promise<PlayTarget | null> {
         p: saved,
         season: saved.season,
         episode: saved.episode,
-        timestamp: saved.timestamp,
+        timestamp: getEpisodeTimestamp(saved, saved.url, saved.season, saved.episode),
       };
     }
   }
@@ -752,16 +791,35 @@ async function interactiveMenu(): Promise<PlayTarget | null> {
         ? dirRaw.trim()
         : "";
 
+    console.log(
+      "\nOptional: paste the series page URL (for auto-detecting new episodes).",
+    );
+    console.log("  e.g. https://www.myf2m.org/series/mobland/");
+    const pageRaw = await prompt("Series page URL [Enter to skip]: ");
+    const pageUrl =
+      !isQuit(pageRaw) && pageRaw.trim() && !isDirectVideoUrl(pageRaw.trim())
+        ? pageRaw.trim()
+        : "";
+
+    let scrapeData: { sourceUrl?: string; source?: SeriesProgress["source"]; knownEpisodes?: string[] } = {};
+    if (pageUrl) {
+      console.log("  Scraping series page...");
+      const result = await scrapeSeriesSource(pageUrl);
+      if (result.ok) {
+        console.log(`  Found ${result.episodes.length} episodes.`);
+        scrapeData = {
+          sourceUrl: pageUrl,
+          source: result.source,
+          knownEpisodes: result.episodes,
+        };
+      } else {
+        console.log("  Could not parse series page — continuing without it.");
+      }
+    }
+
     const isOnetime = await promptYN(
       "One-time? (auto-removed when done) [y/N]: ",
     );
-
-    const existing = store[seriesKey];
-    const startEpisode = existing?.episode ?? 0;
-    const startTimestamp =
-      existing?.season === 1 && existing?.episode === startEpisode
-        ? (existing?.timestamp ?? 0)
-        : 0;
 
     const sortedUrls = videoUrls.sort(
       (a, b) => extractEpisodeNumber(a) - extractEpisodeNumber(b),
@@ -775,14 +833,27 @@ async function interactiveMenu(): Promise<PlayTarget | null> {
       return 1;
     })();
 
+    const existing = store[seriesKey];
+    const startEpisode = existing?.episode ?? 0;
+    const startUrl = sortedUrls.find((u) => {
+      const name = decodeURIComponent(u.split("/").pop()!.split("?")[0]);
+      const m = name.match(/[Ss](\d+)[Ee](\d+)/);
+      if (!m) return false;
+      return parseInt(m[1], 10) === detectedSeason && parseInt(m[2], 10) - 1 === startEpisode;
+    }) ?? sortedUrls[0]!;
+    const startTimestamp = existing
+      ? getEpisodeTimestamp(existing, startUrl, detectedSeason, startEpisode)
+      : 0;
+
     const p: SeriesProgress = {
-      url: dirUrl || sortedUrls[0]!,
+      url: scrapeData.knownEpisodes?.[0] ?? (dirUrl || sortedUrls[0]!),
       season: detectedSeason,
       episode: startEpisode,
       timestamp: startTimestamp,
-      manualUrls: sortedUrls,
+      manualUrls: scrapeData.knownEpisodes ?? sortedUrls,
       isMovie: false,
       isOnetime,
+      ...scrapeData,
     };
     saveProgress(seriesKey, p);
     return {
@@ -809,11 +880,12 @@ async function interactiveMenu(): Promise<PlayTarget | null> {
     const movieKey = sanitiseKey(cn.trim() || guessedName);
     const isOnetime = await promptYN("One-time? [y/N]: ");
     const existing = store[movieKey];
+    const ts = existing && existing.url === url ? existing.timestamp : 0;
     const p: SeriesProgress = {
       url,
       season: 1,
       episode: 0,
-      timestamp: existing?.timestamp ?? 0,
+      timestamp: ts,
       isMovie: true,
       isOnetime,
     };
@@ -829,16 +901,43 @@ async function interactiveMenu(): Promise<PlayTarget | null> {
   if (isQuit(cn2)) return interactiveMenu();
   if (cn2.trim()) seriesKey = sanitiseKey(cn2.trim());
 
+  console.log(
+    "\nOptional: paste the series page URL (for auto-detecting new episodes).",
+  );
+  console.log("  e.g. https://www.myf2m.org/series/mobland/");
+  const pageRaw = await prompt("Series page URL [Enter to skip]: ");
+  const pageUrl =
+    !isQuit(pageRaw) && pageRaw.trim() && !isDirectVideoUrl(pageRaw.trim())
+      ? pageRaw.trim()
+      : "";
+
+  let scrapeData: { sourceUrl?: string; source?: SeriesProgress["source"]; knownEpisodes?: string[] } = {};
+  if (pageUrl) {
+    console.log("  Scraping series page...");
+    const result = await scrapeSeriesSource(pageUrl);
+    if (result.ok) {
+      console.log(`  Found ${result.episodes.length} episodes.`);
+      scrapeData = {
+        sourceUrl: pageUrl,
+        source: result.source,
+        knownEpisodes: result.episodes,
+      };
+    } else {
+      console.log("  Could not parse series page — continuing without it.");
+    }
+  }
+
   const movieChoice = await promptYN("Is this a single movie/special? [y/N]: ");
   const isOnetime = await promptYN("One-time? [y/N]: ");
 
   if (movieChoice) {
     const existing = store[seriesKey];
+    const ts2 = existing && existing.url === url ? existing.timestamp : 0;
     const p: SeriesProgress = {
       url,
       season: 1,
       episode: 0,
-      timestamp: existing?.timestamp ?? 0,
+      timestamp: ts2,
       isMovie: true,
       isOnetime,
     };
@@ -855,13 +954,14 @@ async function interactiveMenu(): Promise<PlayTarget | null> {
   }
   const existing = store[seriesKey];
   const p: SeriesProgress = {
-    url,
+    url: scrapeData.knownEpisodes?.[0] ?? url,
     season,
     episode: episode - 1,
     timestamp: 0,
     isOnetime,
+    manualUrls: scrapeData.knownEpisodes ?? existing?.manualUrls,
+    ...scrapeData,
   };
-  if (existing?.manualUrls) p.manualUrls = existing.manualUrls;
   saveProgress(seriesKey, p);
   return { key: seriesKey, p, season, episode: episode - 1, timestamp: 0 };
 }
@@ -1023,7 +1123,6 @@ export async function runSession(MPV: string, args: string[]) {
   if (args[0]) {
     const rawUrl = args[0];
     args.length = 0;
-    const existing = store[seriesKeyFromUrl(rawUrl)] ?? null;
     if (isDirectVideoUrl(rawUrl)) {
       const k = decodeURIComponent(
         rawUrl
@@ -1032,21 +1131,24 @@ export async function runSession(MPV: string, args: string[]) {
           .split("?")[0]
           .replace(/\.[^.]+$/, ""),
       );
+      const existing = store[k] ?? null;
+      const ts = existing && existing.url === rawUrl ? existing.timestamp : 0;
       const p: SeriesProgress = {
         url: rawUrl,
         season: 1,
         episode: 0,
-        timestamp: existing?.timestamp ?? 0,
+        timestamp: ts,
+        episodeTimestamps: existing?.episodeTimestamps,
         isMovie: true,
       };
-      target = { key: k, p, season: 1, episode: 0, timestamp: p.timestamp };
+      target = { key: k, p, season: 1, episode: 0, timestamp: ts };
     } else {
       const k = seriesKeyFromUrl(rawUrl);
-      const s = existing;
+      const s = store[k] ?? null;
       const season = s?.season ?? 1;
       const episode = s?.episode ?? 0;
       const timestamp =
-        s && s.season === season && s.episode === episode && s.timestamp > 5
+        s && s.url === rawUrl && s.season === season && s.episode === episode && s.timestamp > 5
           ? s.timestamp
           : 0;
       const p: SeriesProgress = { url: rawUrl, season, episode, timestamp };
@@ -1062,6 +1164,11 @@ export async function runSession(MPV: string, args: string[]) {
 
   const { key, p: savedP } = target;
   const p = store[key] ?? savedP;
+
+  if (!p.isMovie && !p.manualUrls?.length) {
+    await ensureSeriesSource(p);
+    if (p.manualUrls?.length) saveProgress(key, p);
+  }
 
   // ── MOVIE ─────────────────────────────────────────────────────────────────
   if ((p.isMovie || isDirectVideoUrl(p.url)) && !p.manualUrls?.length) {
@@ -1123,8 +1230,9 @@ export async function runSession(MPV: string, args: string[]) {
 
   const dirUrl = p.url;
   const canIterateSeasons =
-    !isDirectVideoUrl(dirUrl) &&
-    getSeasonUrl(dirUrl, 1) !== getSeasonUrl(dirUrl, 2);
+    (!isDirectVideoUrl(dirUrl) &&
+    getSeasonUrl(dirUrl, 1) !== getSeasonUrl(dirUrl, 2)) ||
+    seriesHasMultipleSeasons(p);
 
   try {
     outer: while (true) {
@@ -1206,16 +1314,13 @@ export async function runSession(MPV: string, args: string[]) {
           (time) => {
             if (Date.now() - ls > 5000) {
               ls = Date.now();
-              saveProgress(key, {
-                ...store[key]!,
-                season: cs,
-                episode: ce,
-                timestamp: time,
-                cacheOffset:
-                  cur.season === cs && cur.episode === ce
-                    ? cur.cacheOffset
-                    : 0,
-              });
+              saveProgress(key, setEpisodePosition(
+                store[key] ?? p,
+                eu,
+                cs,
+                ce,
+                time,
+              ));
             }
           },
           key,
@@ -1228,15 +1333,13 @@ export async function runSession(MPV: string, args: string[]) {
 
         const { finalPosition, endReason, localPath } = result;
         if (finalPosition) {
-          const sp = store[key]!;
-          saveProgress(key, {
-            ...sp,
-            season: cs,
-            episode: ce,
-            timestamp: finalPosition.time,
-            cacheOffset:
-              result.cacheOffset > 0 ? result.cacheOffset : sp.cacheOffset,
-          });
+          saveProgress(key, setEpisodePosition(
+            store[key] ?? p,
+            eu,
+            cs,
+            ce,
+            finalPosition.time,
+          ));
         }
 
         await offerHardsub(localPath);

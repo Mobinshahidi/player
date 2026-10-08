@@ -16,3 +16,11 @@ player.log
 *.js.map
 .env
 .env.*
+src-tauri/target/
+src-tauri/gen/
+# local tooling / personal data
+.codegraph/
+.qwen/
+*progress-export*.json
+series.json
+mpv-shot*.jpg
