@@ -135,8 +135,21 @@ npm run gui          # builds the Rust shell once, then opens the window
 ```
 
 The first run compiles the Rust shell (a few minutes); later runs start in
-about a second. A desktop entry is provided at `player-gui.desktop`
-(adjust the paths, then copy to `~/.local/share/applications/`).
+about a second.
+
+### Add it to your app launcher
+
+`npm run gui` only opens a dev window — it does **not** install a launcher.
+To add "Player" to your desktop menu:
+
+```bash
+./scripts/install-desktop.sh
+```
+
+This writes `~/.local/share/applications/player.desktop` with this repo's
+resolved paths plus an icon. If it doesn't appear immediately, log out and
+back in (or restart your launcher). Launch logs go to
+`~/.cache/player-gui.log`.
 
 ### Troubleshooting (Linux)
 
