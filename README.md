@@ -148,13 +148,16 @@ only when developing).
 The launcher is installed separately — it isn't a dev mode:
 
 ```bash
-./scripts/install-desktop.sh
+./scripts/install-desktop.sh           # install (or reinstall) the entry
+./scripts/install-desktop.sh --open    # also launch it once as a smoke test
 ```
 
-This writes `~/.local/share/applications/player-gui.desktop` (named **Player
-GUI**) with this repo's resolved paths plus an icon, pointing at
-`run-gui.sh`. If it doesn't appear immediately, log out and back in (or
-restart your launcher). Launch logs go to `~/.cache/player-gui.log`.
+This writes `~/.local/share/applications/player.desktop` (named **Player**,
+replacing any old terminal/TUI entry) with this repo's resolved paths plus an
+icon, pointing at `run-gui.sh`. If it doesn't appear immediately, log out and
+back in (or restart your launcher). Launch logs go to
+`~/.cache/player-gui.log`. Re-run the script after `git pull` if the repo
+moves or you clone elsewhere.
 
 ### Troubleshooting (Linux)
 

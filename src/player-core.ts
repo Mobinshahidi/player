@@ -969,15 +969,15 @@ export function parseSeriesPage(html: string, baseUrl: string): {
     }
   }
 
-  const links = [...h.matchAll(/href="([^"]+\.mkv)"/gi)];
+  const links = [...h.matchAll(/href="([^"]+\.(?:mp4|mkv|avi|mov|webm))"/gi)];
   if (episodes.length === 0 && links.length > 0) {
     for (const m of links) {
       const url = m[1]!;
       const filename = decodeURIComponent(url.split("/").pop()!.split("?")[0]);
+      // Movies carry no SxxEyy → treat as a single episode.
       const seMatch = filename.match(/[Ss](\d{1,2})[Ee](\d{1,3})/);
-      if (!seMatch) continue;
-      const season = parseInt(seMatch[1], 10);
-      const episode = parseInt(seMatch[2], 10) - 1;
+      const season = seMatch ? parseInt(seMatch[1], 10) : 1;
+      const episode = seMatch ? parseInt(seMatch[2], 10) - 1 : 0;
       const qualMatch = filename.match(/(480p|720p|1080p|2160p|4K)/i);
       const quality = qualMatch ? qualMatch[1].toLowerCase() : "unknown";
       const isDub = isDubbedName(filename);

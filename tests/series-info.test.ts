@@ -133,3 +133,23 @@ test("series pages are not misclassified as movies", () => {
   const info = parseSeriesPageInfo(HTML, "https://x/series/mobland/");
   assert.equal(info.isMovie, false);
 });
+
+test("movie pages with plain <a href>.mkv links also parse", () => {
+  const hrefHtml = `<!doctype html><html><head>
+<meta property="og:title" content="Some Film" />
+</head><body>
+<h1 class="entry-title">Some Film (2026)</h1>
+<div class="download-list">
+  <h2>دانلود فیلم با دوبله فارسی</h2>
+  <a href="https://x/Film.2026.1080p.Dubbed.mkv">1080p</a>
+</div>
+<div class="download-list">
+  <h2>دانلود فیلم با زیرنویس چسبیده</h2>
+  <a href="https://x/Film.2026.720p.Farsi.Sub.mkv">720p</a>
+</div>
+</body></html>`;
+  const info = parseSeriesPageInfo(hrefHtml, "https://x/film/");
+  assert.equal(info.episodes.length, 2);
+  assert.equal(info.isMovie, true);
+  assert.deepEqual([...info.summary.variants].sort(), ["dubbled", "hardsub"]);
+});
