@@ -12,6 +12,7 @@
     "windows": [
       {
         "title": "player",
+        "url": "http://127.0.0.1:45871",
         "width": 1100,
         "height": 720,
         "minWidth": 640,

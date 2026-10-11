@@ -10,7 +10,7 @@
     "gui": "tauri dev",
     "gui:server": "node --import tsx src/gui-server.ts",
     "gui:browser": "node --import tsx src/gui-browser.ts",
-    "gui:build": "tauri build",
+    "gui:build": "tauri build --no-bundle",
     "test": "node --import tsx --test"
   },
   "dependencies": {

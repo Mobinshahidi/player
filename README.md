@@ -127,29 +127,35 @@ Tauri uses the system WebKitGTK. One-time setup — pick your distro:
 toolchain (`gcc`/`cc`, `make`, `pkg-config`), `librsvg2`, and `openssl`
 headers. Tauri v2 requires the 4.1 API (not 4.0).
 
-### Run
+### Build once, then run fast
+
+The Rust shell is compiled **once**; daily launches just start the finished
+binary (no compiler, ~1–2 s, ~110–130 MB idle):
 
 ```bash
-npm install
-npm run gui          # builds the Rust shell once, then opens the window
+./scripts/build-gui.sh   # one-time release build (a few minutes)
+./scripts/run-gui.sh     # daily launch: starts server + opens the window
 ```
 
-The first run compiles the Rust shell (a few minutes); later runs start in
-about a second.
+`run-gui.sh` also auto-builds the first time, starts the local Node server,
+waits for it, launches the app, and stops the server when the window closes.
+Logs go to `~/.cache/player-gui.log`.
+
+`npm run gui` is still available as the *dev* flow (recompiles Rust — use it
+only when developing).
 
 ### Add it to your app launcher
 
-`npm run gui` only opens a dev window — it does **not** install a launcher.
-To add "Player" to your desktop menu:
+The launcher is installed separately — it isn't a dev mode:
 
 ```bash
 ./scripts/install-desktop.sh
 ```
 
-This writes `~/.local/share/applications/player.desktop` with this repo's
-resolved paths plus an icon. If it doesn't appear immediately, log out and
-back in (or restart your launcher). Launch logs go to
-`~/.cache/player-gui.log`.
+This writes `~/.local/share/applications/player-gui.desktop` (named **Player
+GUI**) with this repo's resolved paths plus an icon, pointing at
+`run-gui.sh`. If it doesn't appear immediately, log out and back in (or
+restart your launcher). Launch logs go to `~/.cache/player-gui.log`.
 
 ### Troubleshooting (Linux)
 
@@ -158,8 +164,10 @@ back in (or restart your launcher). Launch logs go to
   `WEBKIT_DISABLE_DMABUF_RENDERER=1` by default; to override, export either
   variable yourself before launching.
 - **`webkit2gtk-4.1 not found`** — install the development package
-  (`webkit2gtk4.1-devel` on Fedora, `webkit2gtk-4.1` on Arch) and re-run
-  `npm run gui`.
+  (`webkit2gtk4.1-devel` on Fedora, `webkit2gtk-4.1` on Arch), then re-run
+  `./scripts/build-gui.sh`.
+- **Nothing happens when clicking the launcher** — read
+  `~/.cache/player-gui.log`; it contains the full error.
 - **No Rust toolchain** — use the browser fallback instead:
 
   ```bash
