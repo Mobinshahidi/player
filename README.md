@@ -16,7 +16,7 @@ Terminal-first media player with a fast TUI, a CLI mode, local progress tracking
 - Download resume with exponential-backoff retry on partial transfers
 - Cache progress shown in mpv OSD (desktop)
 - Delete local cache files after watching
-- Hardsub export helper (if [stoh](https://github.com/Mobinshahidi/stoh) + `ffprobe` are installed)
+- Movie & series page scraping (title/posters/descriptions, version & quality)
 - Import/export to the series-project JSON format
 - Deduplicate series-project JSON files
 - Optional S3-compatible cloud sync across devices (Arvan, AWS S3, Cloudflare R2)
@@ -29,7 +29,6 @@ Terminal-first media player with a fast TUI, a CLI mode, local progress tracking
 - Node.js 18+ (tested on Node 22)
 - `mpv`
 - `curl`
-- Optional: [stoh](https://github.com/Mobinshahidi/stoh) + `ffprobe` for hardsub export
 - Optional: Kitty terminal for detached TUI window
 
 ### Android / Termux

@@ -62,6 +62,10 @@ function summarizeUrls(urls: string[]): {
     if (!seasonMap.has(s!)) seasonMap.set(s!, new Set());
     seasonMap.get(s!)!.add(e!);
   }
+  // Movie (single video, no SxxEyy in filenames) → one episode.
+  if (seen.size === 0 && urls.length > 0) {
+    return { totalEpisodes: 1, seasons: [{ season: 1, episodeCount: 1 }] };
+  }
   const seasons = [...seasonMap.entries()]
     .map(([season, eps]) => ({ season, episodeCount: eps.size }))
     .sort((a, b) => a.season - b.season);
@@ -243,6 +247,7 @@ async function handleApi(
       title: info.title,
       description: info.description,
       poster: info.poster,
+      isMovie: info.isMovie,
       summary: info.summary,
       cached: info.cached,
       defaultName,
@@ -285,7 +290,7 @@ async function handleApi(
       season: existing?.season ?? first,
       episode: existing?.episode ?? 0,
       timestamp: existing?.timestamp ?? 0,
-      isMovie: false,
+      isMovie: info.isMovie,
       manualUrls: episodes,
       sourceUrl: url,
       source: { kind: "series-page", variant, quality },

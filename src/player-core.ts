@@ -989,8 +989,56 @@ export function parseSeriesPage(html: string, baseUrl: string): {
     }
   }
 
+  // Movie pages (film2media: /<id>/<movie-slug>/) have no `download-season`
+  // boxes — the download options live directly on the page. Fall back to all
+  // handleDownloadClick() links and classify variants by the nearest Persian
+  // label (دوبله = dubbed, زیرنویس چسبیده/هاردساب = hard sub).
+  if (episodes.length === 0) {
+    const allMatches = [...h.matchAll(/handleDownloadClick\('([^']+\.mkv)'\)/gi)];
+    const sortedMatches = allMatches
+      .map((m) => ({ index: m.index ?? 0, url: m[1]! }))
+      .sort((a, b) => a.index - b.index);
+    for (const { index, url } of sortedMatches) {
+      const filename = decodeURIComponent(url.split("/").pop()!.split("?")[0]);
+      const qualMatch = filename.match(/(480p|720p|1080p|2160p|4K)/i);
+      const quality = qualMatch ? qualMatch[1].toLowerCase() : "unknown";
+      const variant = isDubbedName(filename)
+        ? "dubbled"
+        : variantFromContext(h, index);
+      const key = `1:0:${variant}:${quality}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      episodes.push({ season: 1, episode: 0, variant, quality, url });
+    }
+  }
+
   episodes.sort((a, b) => a.season - b.season || a.episode - b.episode);
   return { title, episodes };
+}
+
+// True when the parsed downloads look like a single film (one video) rather
+// than a multi-episode series — i.e. no filename carries a SxxEyy number.
+export function isMovieFromEpisodes(episodes: ScrapedEpisode[]): boolean {
+  if (episodes.length === 0) return false;
+  return episodes.every(
+    (e) => !/[Ss]\d{1,2}[Ee]\d{1,3}/.test(e.url),
+  );
+}
+
+// Nearest Persian "download kind" label before `at` in the page HTML.
+function variantFromContext(h: string, at: number): string {
+  const ctx = h.slice(0, Math.max(0, at));
+  const dub = ctx.lastIndexOf("دوبله");
+  const dubEn = ctx.lastIndexOf("dubbed", ctx.length) > -1 ? ctx.lastIndexOf("dubbed") : -1;
+  const sub = Math.max(
+    ctx.lastIndexOf("زیرنویس چسبیده"),
+    ctx.lastIndexOf("هاردساب"),
+    ctx.lastIndexOf("زیرنویس"),
+  );
+  const nearest = Math.max(dub, dubEn, sub);
+  if (nearest === -1) return "hardsub";
+  if (nearest === dub || nearest === dubEn) return "dubbled";
+  return "hardsub";
 }
 
 // Pick one URL per (season, episode) matching the preferred variant/quality.
@@ -1113,6 +1161,7 @@ export interface SeriesPageInfo {
   title: string;
   description: string;
   poster: string;
+  isMovie: boolean;
   episodes: ScrapedEpisode[];
   summary: SeriesInfoSummary;
 }
@@ -1124,6 +1173,7 @@ export function parseSeriesPageInfo(html: string, baseUrl: string): SeriesPageIn
     title: meta.title || pageTitle,
     description: meta.description,
     poster: meta.poster,
+    isMovie: isMovieFromEpisodes(episodes),
     episodes,
     summary: summarizeSeriesInfo(episodes),
   };
@@ -1178,6 +1228,7 @@ export interface SeriesInfo {
   title: string;
   description: string;
   poster: string;
+  isMovie: boolean;
   episodes: ScrapedEpisode[];
   summary: SeriesInfoSummary;
 }
@@ -1194,6 +1245,7 @@ export function loadSeriesInfoCache(url: string): SeriesInfo | null {
     if (info.url !== url) return null;
     if (Date.now() - info.fetchedAt > SERIES_INFO_TTL_MS) return null;
     if (!info.summary) info.summary = summarizeSeriesInfo(info.episodes);
+    if (info.isMovie === undefined) info.isMovie = isMovieFromEpisodes(info.episodes);
     return info;
   } catch {
     return null;
@@ -1214,6 +1266,7 @@ export interface ScrapeInfoResult {
   title: string;
   description: string;
   poster: string;
+  isMovie: boolean;
   summary: SeriesInfoSummary;
   episodes: ScrapedEpisode[];
   cached: boolean;
@@ -1237,6 +1290,7 @@ export async function scrapeSeriesPageInfo(
     title: "",
     description: "",
     poster: "",
+    isMovie: false,
     summary: EMPTY_SUMMARY,
     episodes: [],
     cached: false,
@@ -1252,6 +1306,7 @@ export async function scrapeSeriesPageInfo(
         title: cached.title,
         description: cached.description,
         poster: cached.poster,
+        isMovie: cached.isMovie,
         summary: cached.summary,
         episodes: cached.episodes,
         cached: true,
@@ -1273,6 +1328,7 @@ export async function scrapeSeriesPageInfo(
       title: page.title,
       description: page.description,
       poster: page.poster,
+      isMovie: page.isMovie,
       episodes: page.episodes,
       summary: page.summary,
     };
@@ -1283,6 +1339,7 @@ export async function scrapeSeriesPageInfo(
       title: info.title,
       description: info.description,
       poster: info.poster,
+      isMovie: info.isMovie,
       summary: info.summary,
       episodes: info.episodes,
       cached: false,
@@ -2306,6 +2363,7 @@ const FETCH_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 export interface ScrapeResult {
   ok: boolean;
   title: string;
+  isMovie: boolean;
   episodes: string[];
   source: { kind: "series-page"; variant: string; quality: string };
 }
@@ -2317,7 +2375,7 @@ export async function scrapeSeriesSource(
   const variant = opts?.variant ?? "hardsub";
   const quality = opts?.quality ?? "720p";
   const empty: ScrapeResult = {
-    ok: false, title: "", episodes: [],
+    ok: false, title: "", isMovie: false, episodes: [],
     source: { kind: "series-page", variant, quality },
   };
   try {
@@ -2326,10 +2384,18 @@ export async function scrapeSeriesSource(
     const html = await res.text();
     if (!isSeriesPageHtml(html)) return empty;
 
-    const { title, episodes } = resolveSeriesPage(html, pageUrl, { variant, quality });
+    const page = parseSeriesPageInfo(html, pageUrl);
+    if (page.episodes.length === 0) return empty;
+    const episodes = selectEpisodes(page.episodes, { variant, quality });
     if (episodes.length === 0) return empty;
 
-    return { ok: true, title, episodes, source: { kind: "series-page", variant, quality } };
+    return {
+      ok: true,
+      title: page.title,
+      isMovie: page.isMovie,
+      episodes,
+      source: { kind: "series-page", variant, quality },
+    };
   } catch (e: any) {
     console.warn(`[series] Failed to scrape series page: ${e.message}`);
     return empty;
@@ -2349,6 +2415,7 @@ export async function ensureSeriesSource(p: SeriesProgress): Promise<boolean> {
   p.source = result.source;
   p.sourceUrl = target;
   p.url = result.episodes[0] ?? target;
+  p.isMovie = result.isMovie;
   p.newEpisodeCount = 0;
   p.lastEpisodeCheckAt = new Date().toISOString();
   return true;

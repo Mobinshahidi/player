@@ -60,6 +60,9 @@ const I18N = {
     deleted: (n) => `Deleted ${n} file(s)`,
     nothingToDelete: "Nothing to delete",
     partial: (n) => `+${n} new`,
+    movieNote: "Movie · single video",
+    movieFinished: "Movie finished",
+    movieEndBody: "Delete the cached video file?",
   },
   fa: {
     dir: "rtl",
@@ -117,6 +120,9 @@ const I18N = {
     deleted: (n) => `${n} فایل حذف شد`,
     nothingToDelete: "چیزی برای حذف نیست",
     partial: (n) => `${n}+ جدید`,
+    movieNote: "فیلم · یک ویدیو",
+    movieFinished: "فیلم تمام شد",
+    movieEndBody: "فایل کش حذف شود؟",
   },
 };
 
@@ -447,9 +453,14 @@ function maybeSeasonPrompt() {
   const token = `${ended.season}:${ended.count}`;
   if (seasonPromptToken === token || activeModal) return;
   seasonPromptToken = token;
+  const playing = state.series.find((x) => x.key === state.playback?.label);
+  const isMovie = playing ? !!playing.isMovie : false;
   openModal((close) => [
-    el("h2", { text: t("seasonEndTitle", ended.season) }),
-    el("div", { class: "big-desc", text: t("seasonEndBody", ended.count) }),
+    el("h2", { text: isMovie ? t("movieFinished") : t("seasonEndTitle", ended.season) }),
+    el("div", {
+      class: "big-desc",
+      text: isMovie ? t("movieEndBody") : t("seasonEndBody", ended.count),
+    }),
     el("div", { class: "modal-actions" }, [
       el("button", {
         class: "ghost",
@@ -653,6 +664,7 @@ function chooseOptions(info) {
         ...info.summary.seasons.map((s) =>
           el("div", { text: t("seasonLine", s.season, s.episodeCount) }),
         ),
+        info.isMovie ? el("div", { class: "hint", text: t("movieNote") }) : null,
         info.existingKey ? el("div", { class: "hint", text: t("alreadyExists") }) : null,
       ]),
       el("div", { class: "modal-actions" }, [

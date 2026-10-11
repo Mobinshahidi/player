@@ -201,79 +201,6 @@ async function promptManualUrls(context: string): Promise<string[]> {
   return urls.sort((a, b) => extractEpisodeNumber(a) - extractEpisodeNumber(b));
 }
 
-// ─── HARDSUB INTEGRATION ─────────────────────────────────────────────────────
-
-import { spawn as nodeSpawn, execSync as nodeExecSync } from "child_process";
-
-async function offerHardsub(localPath: string): Promise<void> {
-  if (!existsSync(localPath)) return;
-  try {
-    nodeExecSync("which stoh", { stdio: "ignore" });
-  } catch {
-    return;
-  }
-  let want: boolean;
-  try {
-    want = await promptYN("\nCreate hardsub from this episode? [y/N]: ");
-  } catch {
-    return;
-  }
-  if (!want) return;
-  let rawDir: string;
-  try {
-    rawDir = await promptQ(`Output folder [${join(localPath, "..")}]: `);
-  } catch {
-    return;
-  }
-  const outputDir = rawDir || join(localPath, "..");
-  const displayName = cleanFilename(localPath);
-  console.log(
-    `\n[hardsub] Starting in background: ${displayName}\n[hardsub] Output → ${outputDir}\n`,
-  );
-  let totalSeconds = 0;
-  try {
-    const probe = nodeExecSync(
-      `ffprobe -v error -select_streams v:0 -show_entries format=duration -of csv=p=0 "${localPath}"`,
-      { encoding: "utf-8" },
-    ).trim();
-    totalSeconds = parseFloat(probe) || 0;
-  } catch {}
-  const proc = nodeSpawn("stoh", [localPath, "-t", "0", "-d", outputDir], {
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: false,
-  });
-  function parseFfmpegTime(line: string): number | null {
-    const m = line.match(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/);
-    if (!m) return null;
-    return parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseFloat(m[3]);
-  }
-  let hadProgress = false;
-  function handleOutput(data: Buffer) {
-    for (const line of data.toString().split(/[\r\n]+/)) {
-      const t = parseFfmpegTime(line);
-      if (t === null) continue;
-      const pct =
-        totalSeconds > 0
-          ? ` (${Math.min(100, Math.round((t / totalSeconds) * 100))}%)`
-          : "";
-      process.stdout.write(
-        `\r[hardsub] ${displayName}  ${formatTime(Math.round(t))}${pct}   `,
-      );
-      hadProgress = true;
-    }
-  }
-  proc.stdout?.on("data", handleOutput);
-  proc.stderr?.on("data", handleOutput);
-  proc.on("exit", (code) => {
-    if (hadProgress) process.stdout.write("\n");
-    console.log(
-      code === 0
-        ? `[hardsub] ✓ Done: ${displayName}`
-        : `[hardsub] ✗ Failed (exit ${code}): ${displayName}`,
-    );
-  });
-}
-
 // ─── FINISHED STATE PROMPT ────────────────────────────────────────────────────
 
 async function promptAfterFinished(
@@ -1191,7 +1118,6 @@ export async function runSession(MPV: string, args: string[]) {
       cliPrompts,
       { cacheOffsetHint: p.cacheOffset ?? 0 },
     );
-    await offerHardsub(result.localPath);
     const del = await promptYNSoft("Delete local cache file? [Y/n]: ");
     if (del) deleteVideoCache(p.url, key);
     if (result.endReason === "near_end") {
@@ -1342,7 +1268,6 @@ export async function runSession(MPV: string, args: string[]) {
           ));
         }
 
-        await offerHardsub(localPath);
         const del = await promptYNSoft("Delete local cache file? [Y/n]: ");
         if (del) deleteVideoCache(eu, key);
 

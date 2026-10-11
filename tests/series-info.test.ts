@@ -90,3 +90,46 @@ test("summarizeSeriesInfo groups seasons and qualities", () => {
   ]);
   assert.deepEqual(summary.qualities, ["720p", "1080p"]);
 });
+
+// ── movie pages (no download-season boxes) ─────────────────────────────────
+
+const MOVIE_HTML = `<!doctype html><html dir="rtl"><head>
+<meta property="og:title" content="Spider-Man: Brand New Day" />
+<meta property="og:description" content="The movie plot." />
+</head><body>
+<h1 class="entry-title">Spider-Man: Brand New Day (2026)</h1>
+
+<div class="download-list">
+  <h2>دانلود فیلم با دوبله فارسی</h2>
+  <a href="#" onclick="handleDownloadClick('https://x/Spider.Man.Brand.New.Day.2026.1080p.6CH.Farsi.Dubbed.mkv')">1080p</a>
+  <a href="#" onclick="handleDownloadClick('https://x/Spider.Man.Brand.New.Day.2026.720p.6CH.Farsi.Dubbed.mkv')">720p</a>
+</div>
+<div class="download-list">
+  <h2>دانلود فیلم با زیرنویس چسبیده</h2>
+  <a href="#" onclick="handleDownloadClick('https://x/Spider.Man.Brand.New.Day.2026.1080p.6CH.Farsi.Sub.mkv')">1080p</a>
+  <a href="#" onclick="handleDownloadClick('https://x/Spider.Man.Brand.New.Day.2026.720p.6CH.Farsi.Sub.mkv')">720p</a>
+</div>
+</body></html>`;
+
+test("movie pages: parsed without season boxes, classified as a movie", () => {
+  const info = parseSeriesPageInfo(MOVIE_HTML, "https://x/movie/76906/spider-man/");
+  assert.equal(info.episodes.length, 4);
+  assert.equal(info.isMovie, true);
+  assert.equal(info.summary.totalEpisodes, 1);
+  assert.deepEqual(info.summary.seasons, [{ season: 1, episodeCount: 1 }]);
+  assert.deepEqual([...info.summary.variants].sort(), ["dubbled", "hardsub"]);
+  assert.deepEqual(info.summary.qualities, ["720p", "1080p"]);
+
+  const dub = selectEpisodes(info.episodes, { variant: "dubbled", quality: "720p" });
+  assert.equal(dub.length, 1);
+  assert.ok(dub[0]!.includes("Dubbed"));
+
+  const sub1080 = selectEpisodes(info.episodes, { variant: "hardsub", quality: "1080p" });
+  assert.equal(sub1080.length, 1);
+  assert.ok(sub1080[0]!.includes("1080p") && sub1080[0]!.includes("Sub"));
+});
+
+test("series pages are not misclassified as movies", () => {
+  const info = parseSeriesPageInfo(HTML, "https://x/series/mobland/");
+  assert.equal(info.isMovie, false);
+});

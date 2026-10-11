@@ -189,59 +189,6 @@ function sortEpisodeUrls(urls: string[]): string[] {
   });
 }
 
-async function offerHardsubTui(localPath: string): Promise<void> {
-  if (!existsSync(localPath)) return;
-  try {
-    execSync("which stoh", { stdio: "ignore" });
-  } catch {
-    return;
-  }
-  const want = await confirmDialog("Create hardsub from this episode?", "Create");
-  if (!want) return;
-  const rawDir = await promptText("Hardsub", "Output folder:", join(localPath, ".."));
-  if (rawDir === null) return;
-  const outputDir = rawDir || join(localPath, "..");
-  const displayName = localPath.split("/").pop() ?? localPath;
-  showInfo(`Hardsub started: ${displayName}`);
-  let totalSeconds = 0;
-  try {
-    const probe = execSync(
-      `ffprobe -v error -select_streams v:0 -show_entries format=duration -of csv=p=0 "${localPath}"`,
-      { encoding: "utf-8" },
-    ).trim();
-    totalSeconds = parseFloat(probe) || 0;
-  } catch {}
-  const proc = spawn("stoh", [localPath, "-t", "0", "-d", outputDir], {
-    stdio: ["ignore", "pipe", "pipe"],
-    detached: false,
-  });
-  function parseFfmpegTime(line: string): number | null {
-    const m = line.match(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/);
-    if (!m) return null;
-    return parseInt(m[1]) * 3600 + parseInt(m[2]) * 60 + parseFloat(m[3]);
-  }
-  let hadProgress = false;
-  function handleOutput(data: Buffer) {
-    for (const line of data.toString().split(/[\r\n]+/)) {
-      const t = parseFfmpegTime(line);
-      if (t === null) continue;
-      const pct =
-        totalSeconds > 0
-          ? ` (${Math.min(100, Math.round((t / totalSeconds) * 100))}%)`
-          : "";
-      showInfo(`Hardsub ${displayName} ${formatTime(Math.round(t))}${pct}`);
-      hadProgress = true;
-    }
-  }
-  proc.stdout?.on("data", handleOutput);
-  proc.stderr?.on("data", handleOutput);
-  proc.on("exit", (code) => {
-    if (!hadProgress) return;
-    if (code === 0) showInfo(`Hardsub done: ${displayName}`);
-    else showError(`Hardsub failed (exit ${code}): ${displayName}`);
-  });
-}
-
 async function promptAfterFinishedTui(key: string, p: SeriesProgress): Promise<void> {
   if (p.isOnetime) {
     removeEntry(key);
@@ -771,7 +718,6 @@ async function playSelected(): Promise<void> {
         const cur = store[key] ?? p;
         saveProgress(key, setEpisodePosition(cur, p.url, p.season, p.episode, result.finalPosition.time));
       }
-      await offerHardsubTui(result.localPath);
       if (await confirmDialog("Delete local cache file?", "Delete")) {
         deleteVideoCache(p.url, key);
       }
@@ -876,30 +822,19 @@ async function playSelected(): Promise<void> {
               setEpisodePosition(store[key] ?? p, epUrl, season, episode, result.finalPosition.time),
             );
           }
-          await offerHardsubTui(result.localPath);
           if (await confirmDialog("Delete local cache file?", "Delete")) {
             deleteVideoCache(epUrl, key);
           }
 
+          // User closed mpv early → stop the session (like the GUI).
           if (result.endReason !== "near_end") {
-            if (episode + 1 < episodes.length) {
-              if (await confirmDialog(`Play S${season}E${episode + 2} next?`, "Play")) {
-                episode += 1;
-                saveProgress(key, {
-                  ...(store[key] ?? p),
-                  season,
-                  episode,
-                  timestamp: 0,
-                  cacheOffset: 0,
-                });
-                continue;
-              }
-            } else {
+            if (episode + 1 >= episodes.length) {
               await promptAfterFinishedTui(key, store[key] ?? p);
             }
             return;
           }
 
+          // Episode finished → advance to the next one automatically.
           episode += 1;
           if (episode >= episodes.length) {
             if (canIterateSeasons && (!p.manualUrls?.length || seriesHasMultipleSeasons(p))) {
@@ -930,9 +865,6 @@ async function playSelected(): Promise<void> {
             timestamp: 0,
             cacheOffset: 0,
           });
-          if (!(await confirmDialog(`Play S${season}E${episode + 1} next?`, "Play"))) {
-            return;
-          }
         }
       }
     }
@@ -1281,7 +1213,9 @@ async function showNewEntryModal(): Promise<void> {
     if (!ok) return;
   }
 
-  const isMovie = !pageUrl && (urls.length > 1 ? false : isDirectVideoUrl(firstUrl));
+  const isMovie =
+    (scrapeResult?.isMovie ?? false) ||
+    (!pageUrl && (urls.length > 1 ? false : isDirectVideoUrl(firstUrl)));
 
   const p: SeriesProgress = {
     url: scrapeResult?.episodes[0] ?? firstUrl,
