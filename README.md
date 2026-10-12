@@ -143,10 +143,13 @@ roughly 30–50 MB and there is no compiler running at launch.
 ./scripts/install-desktop.sh --open    # also launch it once as a smoke test
 ```
 
-This writes `~/.local/share/applications/player.desktop` (named **Player**)
-pointing at `run-native.sh`, plus an icon. If it doesn't appear immediately,
-log out and back in (or restart your launcher). Launch logs go to
-`~/.cache/player-gui.log`. Re-run after `git pull` if the repo moves.
+This writes two launchers:
+- **Player** — `Terminal=true`, opens the **TUI** in a terminal (search "player").
+- **Player GUI** — `Terminal=false`, opens the **native** window.
+
+Plus the icon. If they don't appear immediately, log out and back in (or restart
+your launcher). Launch logs go to `~/.cache/player-gui.log`. Re-run after
+`git pull` if the repo moves.
 
 ### Troubleshooting (Linux)
 
