@@ -174,6 +174,23 @@ static char *fmt_ts(double sec) {
   return g_strdup_printf("%d:%02d", s / 60, s % 60);
 }
 
+/* Share the progress store with the TUI app when we're inside the repo. */
+static char *resolve_store_path(void) {
+  const char *env = g_getenv("PLAYER_PROGRESS");
+  if (env && *env) return g_strdup(env);
+  char *exe = g_file_read_link("/proc/self/exe", NULL);
+  if (exe) {
+    char *dir = g_path_get_dirname(exe);   /* .../native */
+    char *repo = g_path_get_dirname(dir);  /* repo root */
+    char *p = g_strdup_printf("%s/src/.mpv-web-player/progress.json", repo);
+    g_free(exe);
+    g_free(dir);
+    g_free(repo);
+    return p;
+  }
+  return g_build_filename(g_get_user_data_dir(), "player", "progress.json", NULL);
+}
+
 /* ── pb callbacks ──────────────────────────────────────────────────────────── */
 
 void ui_refresh_np(void *ud) { refresh_np(ud); }
@@ -795,8 +812,8 @@ static void activate(GtkApplication *gapp, gpointer ud) {
 
   App *app = g_new0(App, 1);
   g_app = app;
-  const char *base = g_get_user_data_dir();
-  app->store_path = g_build_filename(base, "player", "progress.json", NULL);
+  app->store_path = resolve_store_path();
+  g_message("store: %s", app->store_path);
   store_init(&app->store);
   app->filter = g_strdup("");
   store_load(&app->store, app->store_path);

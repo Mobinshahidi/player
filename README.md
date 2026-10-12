@@ -79,8 +79,9 @@ A simple, clean desktop window for non-technical users: paste a series link,
 pick the version and quality, and watch. Playback still runs in `mpv`; the
 window is the library/control panel.
 
-**Local-only:** no cloud sync, no secrets file. Progress is stored in
-`~/.local/share/player/progress.json`.
+**Local-only:** no cloud sync, no secrets file. It opens the **same progress
+store as the TUI** (`src/.mpv-web-player/progress.json`), so your existing
+series list carries over automatically; both apps share it.
 
 ### What it does
 

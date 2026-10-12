@@ -30,6 +30,7 @@ typedef struct {
 typedef struct {
   Entry **items;
   int n;
+  char *deleted_json; /* raw "_deleted" member preserved across saves */
 } Store;
 
 void store_init(Store *s);

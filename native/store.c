@@ -171,11 +171,13 @@ void store_clear(Store *s) {
   free(s->items);
   s->items = NULL;
   s->n = 0;
+  g_free(s->deleted_json);
+  s->deleted_json = NULL;
 }
 
 static int jnum(const JVal *v, int def) {
   if (!v || v->t != J_NUM) return def;
-  return (int)v->n;
+  return (int)v->num;
 }
 static double jdbl(const JVal *v, double def) {
   return v && v->t == J_NUM ? v->num : def;
@@ -215,12 +217,23 @@ gboolean store_load(Store *s, const char *path) {
     const char *k = root->a[i]->s;
     JVal *o = root->a[i + 1];
     if (!k || o->t != J_OBJ) continue;
+    /* reserved members (e.g. "_deleted" deletion log) are preserved */
+    if (k[0] == '_') {
+      if (strcmp(k, "_deleted") == 0) {
+        g_free(s->deleted_json);
+        s->deleted_json = jdump(o);
+      }
+      continue;
+    }
+    if (!jstr(jv_get(o, "url"))) continue; /* skip non-entry members */
     Entry *e = entry_new();
     e->key = g_strdup(k);
     e->name = jstr(jv_get(o, "name")) ? g_strdup(jstr(jv_get(o, "name"))) : pretty_key(k);
     e->url = jstr(jv_get(o, "url")) ? g_strdup(jstr(jv_get(o, "url"))) : g_strdup("");
     e->season = jnum(jv_get(o, "season"), 1);
     e->episode = jnum(jv_get(o, "episode"), 0);
+    if (e->season <= 0) e->season = 1;
+    if (e->episode < 0) e->episode = 0;
     e->timestamp = jdbl(jv_get(o, "timestamp"), 0);
     e->finished = jbool(jv_get(o, "finished"), 0);
     e->is_movie = jbool(jv_get(o, "isMovie"), 0);
@@ -234,6 +247,15 @@ gboolean store_load(Store *s, const char *path) {
       e->quality = jstr(jv_get(src, "quality")) ? g_strdup(jstr(jv_get(src, "quality"))) : NULL;
     }
     jarr_strings(jv_get(o, "manualUrls"), &e->manual_urls, &e->manual_urls_len);
+    /* carry over the per-episode resume position for the current episode
+     * (the TS app keys these by the filename's SxxEyy identity) */
+    JVal *ets = jv_get(o, "episodeTimestamps");
+    if (ets && ets->t == J_OBJ) {
+      char id[32];
+      g_snprintf(id, sizeof id, "S%02dE%02d", e->season, e->episode + 1);
+      JVal *pos = jv_get(ets, id);
+      if (pos && pos->t == J_NUM) e->timestamp = pos->num;
+    }
     entry_compute_summaries(e);
     s->items = realloc(s->items, (s->n + 1) * sizeof(Entry *));
     s->items[s->n++] = e;
@@ -278,6 +300,10 @@ gboolean store_save(Store *s, const char *path) {
     }
     jv_set(o, "updatedAt", jv_str(e->updated_at));
     jv_set(root, e->key ? e->key : "", o);
+  }
+  if (s->deleted_json) {
+    JVal *d = jparse(s->deleted_json);
+    if (d) jv_set(root, "_deleted", d);
   }
   char *json = jdump(root);
   jv_free(root);

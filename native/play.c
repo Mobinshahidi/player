@@ -1,5 +1,6 @@
 #include "play.h"
 #include "jmini.h"
+#include "scrape.h"
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -219,8 +220,64 @@ static void pb_on_mpv_exit(GPid pid, gint status, gpointer user) {
   }
 }
 
+/* Background scrape used when an entry has no saved episode URLs
+ * (the TUI resolved those at play time). */
+typedef struct {
+  Playback *pb;
+  Entry *e;
+  int season;
+  char **urls;
+  int n;
+} PBFetch;
+
+static gboolean pb_fetched_idle(gpointer d);
+
+static gpointer pb_fetch_thread(gpointer d) {
+  PBFetch *f = d;
+  int n = 0;
+  char **urls = NULL;
+  ScrapeInfo *si = scrape_fetch(f->e->source_url);
+  if (si && si->ok) {
+    const char *v = f->e->variant ? f->e->variant : "hardsub";
+    const char *q = f->e->quality ? f->e->quality : "720p";
+    urls = scrape_select(si, v, q, &n);
+  }
+  if (si) scrape_free(si);
+
+  PBFetch *r = g_new0(PBFetch, 1);
+  r->pb = f->pb;
+  r->e = f->e;
+  r->season = f->season;
+  r->n = n;
+  r->urls = urls;
+  g_free(f);
+  g_idle_add_full(G_PRIORITY_DEFAULT_IDLE, pb_fetched_idle, r, g_free);
+  return NULL;
+}
+
+static gboolean pb_fetched_idle(gpointer d) {
+  PBFetch *r = d;
+  if (r->n > 0) {
+    for (int i = 0; i < r->e->manual_urls_len; i++) g_free(r->e->manual_urls[i]);
+    g_free(r->e->manual_urls);
+    r->e->manual_urls = r->urls;
+    r->e->manual_urls_len = r->n;
+    entry_compute_summaries(r->e);
+    r->pb->cb.on_save(r->pb->cb.ud);
+    pb_start(r->pb, r->e, r->season); /* now has saved URLs → plays */
+  } else {
+    if (r->urls) { for (int i = 0; i < r->n; i++) g_free(r->urls[i]); g_free(r->urls); }
+    r->pb->cb.on_stopped(r->pb->cb.ud);
+  }
+  return G_SOURCE_REMOVE;
+}
+
 void pb_start(Playback *pb, Entry *e, int season) {
   pb_stop(pb);
+  pb->key = g_strdup(e->key);
+  pb->entry = e;
+  pb->season = season;
+
   GArray *urls = g_array_new(FALSE, FALSE, sizeof(char *));
   if (e->is_movie) {
     if (e->url && *e->url) g_array_append_val(urls, e->url);
@@ -248,12 +305,17 @@ void pb_start(Playback *pb, Entry *e, int season) {
   }
   if (urls->len == 0) {
     g_array_free(urls, TRUE);
+    if (!e->is_movie && e->source_url && *e->source_url) {
+      PBFetch *f = g_new0(PBFetch, 1);
+      f->pb = pb;
+      f->e = e;
+      f->season = season;
+      g_thread_new("pb-fetch", pb_fetch_thread, f);
+      return; /* playback begins when the scrape finishes */
+    }
     pb->cb.on_stopped(pb->cb.ud);
     return;
   }
-  pb->key = g_strdup(e->key);
-  pb->entry = e;
-  pb->season = season;
   pb->n = (int)urls->len;
   pb->urls = g_new(char *, pb->n);
   for (int i = 0; i < pb->n; i++) {
