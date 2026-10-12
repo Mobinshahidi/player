@@ -79,37 +79,36 @@ A simple, clean desktop window for non-technical users: paste a series link,
 pick the version and quality, and watch. Playback still runs in `mpv`; the
 window is the library/control panel.
 
-**Local-only:** the GUI never uses cloud sync, even if a secrets file or
-`storage.json` is present. It shares the same local progress store, settings,
-and video cache as the TUI.
+**Local-only:** no cloud sync, no secrets file. Progress is stored in
+`~/.local/share/player/progress.json`.
 
 ### What it does
 
-- Paste a series page link (e.g. `https://www.myf2m.org/series/mobland/`).
-- If the page was not scraped before, it scrapes it; otherwise the cached
-  result (1 h TTL) is used. A **Refresh** button forces a re-scrape.
+- Paste a series or movie page link (e.g. `https://www.myf2m.org/series/mobland/`
+  or `https://www.myf2m.org/76906/spider-man-brand-new-day/`).
+- Scrapes the page: title, description, poster, and the available download
+  options.
 - Asks which **version** (Dubbed / Hard sub) and which **quality**
   (**720p by default**).
 - Shows how many episodes exist **this season** and **in the series**, plus
-  the scraped **description and poster** in the right sidebar.
-- Plays episodes back-to-back (the next episode is prefetched), and when a
-  season ends it asks whether to **delete that season's cached episodes**.
-- The **hardsub export** feature (burn-in via `stoh`) is intentionally not
-  part of the GUI.
+  the scraped description in the right sidebar.
+- Plays episodes **back-to-back** (auto-advance), resumes where you left off,
+  and asks whether to delete cached episodes when a season (or movie) ends.
+- EN/FA interface with LTR/RTL, and a search box.
+- The **hardsub export** feature is intentionally not part of the GUI.
 
 ### Build dependencies
 
-Tauri uses the system WebKitGTK. One-time setup — pick your distro:
+The GUI is a **native GTK4 app written in C** — no Node, no webview, no Rust.
+It only needs a C toolchain and the GTK4 dev headers. One-time setup:
 
 **Fedora**
 
 ```bash
 ./scripts/setup-fedora.sh
 # equivalent to:
-#   sudo dnf install -y nodejs npm mpv curl wget file \
-#     webkit2gtk4.1-devel javascriptcoregtk4.1-devel libsoup3-devel \
-#     openssl-devel librsvg2-devel libappindicator-gtk3-devel \
-#     gcc gcc-c++ make pkgconf-pkg-config rust cargo
+#   sudo dnf install -y gcc make pkgconf-pkg-config gtk4-devel \
+#     glib2-devel libcurl-devel mpv curl
 ```
 
 **Arch Linux**
@@ -117,64 +116,47 @@ Tauri uses the system WebKitGTK. One-time setup — pick your distro:
 ```bash
 ./scripts/setup-arch.sh
 # equivalent to:
-#   sudo pacman -S --needed nodejs npm mpv curl \
-#     rust webkit2gtk-4.1 base-devel \
-#     libappindicator-gtk3 librsvg patchelf openssl
+#   sudo pacman -S --needed gcc make pkgconf gtk4 glib2 libcurl mpv curl
 ```
 
-**Other distros:** install WebKitGTK **4.1** development headers plus a C
-toolchain (`gcc`/`cc`, `make`, `pkg-config`), `librsvg2`, and `openssl`
-headers. Tauri v2 requires the 4.1 API (not 4.0).
+**Other distros:** a C compiler, `pkg-config`, GTK4 (+glib2) and libcurl
+development headers, plus `mpv` and `curl` at runtime.
 
 ### Build once, then run fast
 
-The Rust shell is compiled **once**; daily launches just start the finished
-binary (no compiler, ~1–2 s, ~110–130 MB idle):
+Compile the single binary once (a few seconds); every launch after that is
+instant:
 
 ```bash
-./scripts/build-gui.sh   # one-time release build (a few minutes)
-./scripts/run-gui.sh     # daily launch: starts server + opens the window
+./scripts/build-native.sh   # native/player (~a few seconds, once)
+./scripts/run-native.sh     # daily launch — just runs the binary
 ```
 
-`run-gui.sh` also auto-builds the first time, starts the local Node server,
-waits for it, launches the app, and stops the server when the window closes.
-Logs go to `~/.cache/player-gui.log`.
-
-`npm run gui` is still available as the *dev* flow (recompiles Rust — use it
-only when developing).
+`run-native.sh` builds automatically the first time if needed. Idle RAM is
+roughly 30–50 MB and there is no compiler running at launch.
 
 ### Add it to your app launcher
 
-The launcher is installed separately — it isn't a dev mode:
-
 ```bash
-./scripts/install-desktop.sh           # install (or reinstall) the entry
+./scripts/install-desktop.sh           # install (or reinstall) "Player"
 ./scripts/install-desktop.sh --open    # also launch it once as a smoke test
 ```
 
-This writes `~/.local/share/applications/player.desktop` (named **Player**,
-replacing any old terminal/TUI entry) with this repo's resolved paths plus an
-icon, pointing at `run-gui.sh`. If it doesn't appear immediately, log out and
-back in (or restart your launcher). Launch logs go to
-`~/.cache/player-gui.log`. Re-run the script after `git pull` if the repo
-moves or you clone elsewhere.
+This writes `~/.local/share/applications/player.desktop` (named **Player**)
+pointing at `run-native.sh`, plus an icon. If it doesn't appear immediately,
+log out and back in (or restart your launcher). Launch logs go to
+`~/.cache/player-gui.log`. Re-run after `git pull` if the repo moves.
 
 ### Troubleshooting (Linux)
 
-- **Blank or white window** — WebKitGTK compositing issues on Wayland/NVIDIA.
-  The app already sets `WEBKIT_DISABLE_COMPOSITING_MODE=1` and
-  `WEBKIT_DISABLE_DMABUF_RENDERER=1` by default; to override, export either
-  variable yourself before launching.
-- **`webkit2gtk-4.1 not found`** — install the development package
-  (`webkit2gtk4.1-devel` on Fedora, `webkit2gtk-4.1` on Arch), then re-run
-  `./scripts/build-gui.sh`.
+- **`GTK4 development headers not found`** — install the dev package
+  (`gtk4-devel` on Fedora, `gtk4` on Arch), then re-run
+  `./scripts/build-native.sh`.
 - **Nothing happens when clicking the launcher** — read
   `~/.cache/player-gui.log`; it contains the full error.
-- **No Rust toolchain** — use the browser fallback instead:
-
-  ```bash
-  npm run gui:browser  # starts the server and opens it in your browser
-  ```
+- **Video stutters** — playback uses `mpv --hwdec=auto` (hardware decode). If
+  your driver still struggles, call the binary yourself with mpv flags, e.g.
+  `mpv --hwdec=no` for software decode.
 
 ## Run (CLI)
 

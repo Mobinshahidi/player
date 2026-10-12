@@ -18,6 +18,9 @@ player.log
 .env.*
 src-tauri/target/
 src-tauri/gen/
+native/*.o
+native/player
+native/test-parse
 # local tooling / personal data
 .codegraph/
 .qwen/

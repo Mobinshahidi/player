@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# One-time system dependencies for the player GUI on Arch Linux.
+# One-time system dependencies for the native player on Arch Linux.
 # Usage: ./scripts/setup-arch.sh
 set -euo pipefail
 
 sudo pacman -S --needed --noconfirm \
-  nodejs npm mpv curl \
-  rust webkit2gtk-4.1 base-devel \
-  libappindicator-gtk3 librsvg patchelf openssl
+  gcc make pkgconf gtk4 glib2 libcurl \
+  mpv curl
 
 echo
 echo "System packages installed."
 echo "Next:"
-echo "  npm install"
-echo "  npm run gui"
+echo "  ./scripts/build-native.sh"
+echo "  ./scripts/install-desktop.sh"
+echo "  ./scripts/run-native.sh"
