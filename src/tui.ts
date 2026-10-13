@@ -41,6 +41,7 @@ import {
   IS_TERMUX,
   CONFIG_DIR,
   deleteVideoCache,
+  deleteSeasonCache,
   isDirectVideoUrl,
   isYouTubeUrl,
   playWithMpv,
@@ -187,6 +188,20 @@ function sortEpisodeUrls(urls: string[]): string[] {
     }
     return extractEpisodeNumber(a) - extractEpisodeNumber(b);
   });
+}
+
+// Cache is only cleaned up when a season (or movie) finishes — episodes auto-
+// play without asking anything in between.
+async function askDeleteFinishedCache(key: string, urls: string[]): Promise<void> {
+  if (urls.length === 0) return;
+  const want = await confirmDialog(
+    `Season/movie finished. Delete the ${urls.length} cached video file(s)?`,
+    "Delete - yes",
+  );
+  if (want) {
+    const n = deleteSeasonCache(urls, key);
+    showInfo(`Deleted ${n} cached file(s)`);
+  }
 }
 
 async function promptAfterFinishedTui(key: string, p: SeriesProgress): Promise<void> {
@@ -718,10 +733,8 @@ async function playSelected(): Promise<void> {
         const cur = store[key] ?? p;
         saveProgress(key, setEpisodePosition(cur, p.url, p.season, p.episode, result.finalPosition.time));
       }
-      if (await confirmDialog("Delete local cache file?", "Delete")) {
-        deleteVideoCache(p.url, key);
-      }
       if (result.endReason === "near_end") {
+        await askDeleteFinishedCache(key, [p.url]);
         await promptAfterFinishedTui(key, store[key] ?? p);
       }
     } else {
@@ -822,9 +835,6 @@ async function playSelected(): Promise<void> {
               setEpisodePosition(store[key] ?? p, epUrl, season, episode, result.finalPosition.time),
             );
           }
-          if (await confirmDialog("Delete local cache file?", "Delete")) {
-            deleteVideoCache(epUrl, key);
-          }
 
           // User closed mpv early → stop the session (like the GUI).
           if (result.endReason !== "near_end") {
@@ -837,6 +847,7 @@ async function playSelected(): Promise<void> {
           // Episode finished → advance to the next one automatically.
           episode += 1;
           if (episode >= episodes.length) {
+            await askDeleteFinishedCache(key, episodes);
             if (canIterateSeasons && (!p.manualUrls?.length || seriesHasMultipleSeasons(p))) {
               const next = await confirmDialog(`Season ${season} done. Continue to Season ${season + 1}?`, "Continue");
               if (!next) {

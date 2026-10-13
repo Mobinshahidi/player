@@ -20,6 +20,7 @@ import {
   schedulePush,
   playWithMpv,
   deleteVideoCache,
+  deleteSeasonCache,
   renderProgress,
   formatTime,
   extractEpisodeNumber,
@@ -1118,7 +1119,11 @@ export async function runSession(MPV: string, args: string[]) {
       cliPrompts,
       { cacheOffsetHint: p.cacheOffset ?? 0 },
     );
-    const del = await promptYNSoft("Delete local cache file? [Y/n]: ");
+    const del = await promptYNSoft(
+      result.endReason === "near_end"
+        ? "Movie finished. Delete the cached file? [y/N]: "
+        : "Delete local cache file? [Y/n]: ",
+    );
     if (del) deleteVideoCache(p.url, key);
     if (result.endReason === "near_end") {
       console.log(`\n✓  ${key} — finished!`);
@@ -1268,12 +1273,13 @@ export async function runSession(MPV: string, args: string[]) {
           ));
         }
 
-        const del = await promptYNSoft("Delete local cache file? [Y/n]: ");
-        if (del) deleteVideoCache(eu, key);
-
         if (endReason === "near_end") {
           ce++;
           if (ce >= eps.length) {
+            // Season finished → offer to clear this season's cache files.
+            if (await promptYNSoft(`Season ${cs} done. Delete ${eps.length} cached file(s)? [y/N]: `)) {
+              deleteSeasonCache(eps, key);
+            }
             if (!canIterateSeasons && seasonManualUrls.length > 0) {
               console.log(`\n✓ All episodes complete!`);
               saveProgress(key, {
